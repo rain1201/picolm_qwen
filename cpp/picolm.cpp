@@ -88,7 +88,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    TensorOps::set_threads(num_threads);
+    TensorOps::init_thread_pool(num_threads);
 
     // Load tokenizer
     Tokenizer tokenizer;
@@ -166,12 +166,14 @@ int main(int argc, char** argv) {
     double prefill_time = (t_first_token - t_start) / 1000.0;
 
     std::cerr << "---\n";
-    std::cerr << "Prefill: " << n_prompt << " tokens in " << prefill_time 
+    std::cerr << "Prefill: " << n_prompt << " tokens in " << prefill_time
               << "s (" << (prefill_time > 0 ? n_prompt / prefill_time : 0) << " tok/s)\n";
-    std::cerr << "Generation: " << total_gen << " tokens in " << gen_time 
+    std::cerr << "Generation: " << total_gen << " tokens in " << gen_time
               << "s (" << (gen_time > 0 ? total_gen / gen_time : 0) << " tok/s)\n";
     std::cerr << "Total: " << total_time << "s\n";
     std::cerr << "Memory: " << (model.state.mem_size / (1024.0 * 1024.0)) << " MB runtime state\n";
+
+    TensorOps::cleanup_thread_pool();
 
     return 0;
 }
