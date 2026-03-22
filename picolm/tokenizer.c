@@ -123,15 +123,15 @@ int tokenizer_encode(const tokenizer_t *t, const char *text, int *tokens, int ma
     int norm_len = 0;
 
     /* Add leading ▁ */
-    norm[norm_len++] = (char)0xE2;
-    norm[norm_len++] = (char)0x96;
-    norm[norm_len++] = (char)0x81;
+    //norm[norm_len++] = (char)0xE2;
+    //norm[norm_len++] = (char)0x96;
+    //norm[norm_len++] = (char)0x81;
 
     for (int i = 0; i < text_len; i++) {
         if (text[i] == ' ') {
-            norm[norm_len++] = (char)0xE2;
-            norm[norm_len++] = (char)0x96;
-            norm[norm_len++] = (char)0x81;
+            //norm[norm_len++] = (char)0xE2;
+            //norm[norm_len++] = (char)0x96;
+            //norm[norm_len++] = (char)0x81;
         } else {
             norm[norm_len++] = text[i];
         }
@@ -221,6 +221,43 @@ int tokenizer_encode(const tokenizer_t *t, const char *text, int *tokens, int ma
 }
 
 const char *tokenizer_decode(const tokenizer_t *t, int prev_token, int token) {
+    if (token < 0 || token >= t->vocab_size) return "";
+
+    const char *str = t->vocab[token];
+    static char clean_buf[512]; // 用于存储处理后的字符串
+    
+    int j = 0;
+    for (int i = 0; str[i] != '\0' && j < 511; i++) {
+        unsigned char c = (unsigned char)str[i];
+
+        // 处理 Qwen/GPT-2 的字节级 BPE 映射
+        // Ġ (UTF-8: 0xC4 0x82) -> 空格
+        if (c == 0xC4 && (unsigned char)str[i+1] == 0xA0) {
+            clean_buf[j++] = ' ';
+            i++; 
+        }
+        // Ċ (UTF-8: 0xC4 0x8A) -> 换行
+        else if (c == 0xC4 && (unsigned char)str[i+1] == 0x8A) {
+            clean_buf[j++] = '\n';
+            i++;
+        }
+        // 处理字节 Token <0xHH>
+        else if (str[i] == '<' && str[i+1] == '0' && str[i+2] == 'x' && str[i+5] == '>') {
+            unsigned int val = 0;
+            if (sscanf(str + i, "<0x%02X>", &val) == 1) {
+                clean_buf[j++] = (char)val;
+                i += 5;
+            }
+        }
+        else {
+            clean_buf[j++] = str[i];
+        }
+    }
+    clean_buf[j] = '\0';
+    return clean_buf;
+}
+
+const char *tokenizer_decode_ori(const tokenizer_t *t, int prev_token, int token) {
     if (token < 0 || token >= t->vocab_size) return "";
 
     const char *str = t->vocab[token];

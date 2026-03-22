@@ -32,19 +32,20 @@ static inline float hsum_sse(__m128 v) {
 
 /* GGUF tensor data types */
 typedef enum {
-    GGUF_TYPE_F32   = 0,
-    GGUF_TYPE_F16   = 1,
-    GGUF_TYPE_Q4_0  = 2,
-    GGUF_TYPE_Q4_1  = 3,
-    GGUF_TYPE_Q5_0  = 6,
-    GGUF_TYPE_Q5_1  = 7,
-    GGUF_TYPE_Q8_0  = 8,
-    GGUF_TYPE_Q8_1  = 9,
-    GGUF_TYPE_Q2_K  = 10,
-    GGUF_TYPE_Q3_K  = 11,
-    GGUF_TYPE_Q4_K  = 12,
-    GGUF_TYPE_Q5_K  = 13,
-    GGUF_TYPE_Q6_K  = 14,
+    GGUF_TYPE_NONE  = 0,
+    GGUF_TYPE_F32   = 1,
+    GGUF_TYPE_F16   = 2,
+    GGUF_TYPE_Q4_0  = 3,
+    GGUF_TYPE_Q4_1  = 4,
+    GGUF_TYPE_Q5_0  = 7,
+    GGUF_TYPE_Q5_1  = 8,
+    GGUF_TYPE_Q8_0  = 9,
+    GGUF_TYPE_Q8_1  = 10,
+    GGUF_TYPE_Q2_K  = 11,
+    GGUF_TYPE_Q3_K  = 12,
+    GGUF_TYPE_Q4_K  = 13,
+    GGUF_TYPE_Q5_K  = 14,
+    GGUF_TYPE_Q6_K  = 15,
 } gguf_type_t;
 
 /* Q4_K block: 256 weights in 144 bytes */

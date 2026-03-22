@@ -221,6 +221,7 @@ int main(int argc, char **argv) {
 
             /* Decode and print */
             const char *piece = tokenizer_decode(&tokenizer, token, next);
+            printf("[%d]", next);
             printf("%s", piece);
             fflush(stdout);
 

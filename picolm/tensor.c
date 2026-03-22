@@ -121,6 +121,18 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
     }
 }
 
+void matmul_bias(float* out, const float* x, const void* W, const void* b, 
+                        int n, int d, gguf_type_t w_type, gguf_type_t b_type, float* scratch) {
+    // 1. 先做矩阵乘法
+    matmul(out, x, W, n, d, w_type);
+    
+    // 2. 如果有 Bias，反量化并累加
+    if (b_type != GGUF_TYPE_NONE && b != NULL) {
+        dequantize_row(b, scratch, d, b_type);
+        vec_add(out, scratch, d);
+    }
+}
+
 /* ================================================================
  * SIMD-accelerated basic operations
  * ================================================================ */
@@ -150,7 +162,7 @@ void rmsnorm(float *out, const float *x, const float *weight, int size) {
     for (int i = 0; i < size; i++) ss += x[i] * x[i];
 #endif
 
-    ss = 1.0f / sqrtf(ss / (float)size + 1e-5f);
+    ss = 1.0f / sqrtf(ss / (float)size + 1e-6f);
 
 #ifdef PICOLM_NEON
     float32x4_t scale = vdupq_n_f32(ss);

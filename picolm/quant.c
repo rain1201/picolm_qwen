@@ -271,6 +271,7 @@ void dequantize_row(const void *src, float *dst, int n, gguf_type_t type) {
         case GGUF_TYPE_Q2_K:  dequantize_row_q2_K(src, dst, n); break;
         case GGUF_TYPE_Q3_K:  dequantize_row_q3_K(src, dst, n); break;
         case GGUF_TYPE_Q4_K:  dequantize_row_q4_K(src, dst, n); break;
+        //case GGUF_TYPE_Q5_K:  dequantize_row_q5_K(src, dst, n); break;
         case GGUF_TYPE_Q6_K:  dequantize_row_q6_K(src, dst, n); break;
         default:
             fprintf(stderr, "dequantize_row: unsupported type %d\n", type);

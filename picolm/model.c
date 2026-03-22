@@ -1,6 +1,7 @@
 #include "model.h"
 #include "tensor.h"
 #include "quant.h"
+#include "keys.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -96,6 +97,29 @@ static gguf_str_t read_gguf_string(reader_t *r) {
 static int str_eq(gguf_str_t s, const char *lit) {
     size_t n = strlen(lit);
     return s.len == n && memcmp(s.str, lit, n) == 0;
+}
+
+static int key_is(gguf_str_t key, const char *target) {
+    // 1. 尝试完全匹配
+    if (str_eq(key, target)) return 1;
+
+    // 2. 尝试跳过架构前缀匹配 (寻找第一个 '.' 之后的内容)
+    const char *first_dot = NULL;
+    for (uint64_t i = 0; i < key.len; i++) {
+        if (key.str[i] == '.') {
+            first_dot = key.str + i + 1;
+            break;
+        }
+    }
+
+    if (first_dot) {
+        size_t prefix_len = (size_t)(first_dot - key.str);
+        size_t suffix_len = (size_t)(key.len - prefix_len);
+        if (suffix_len == strlen(target) && memcmp(first_dot, target, suffix_len) == 0) {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 static uint64_t skip_meta_value(reader_t *r, uint32_t vtype, int *is_numeric) {
@@ -225,6 +249,7 @@ static int parse_gguf(model_t *m, int max_seq_len) {
     cfg->rope_freq_base = 10000.0f;
     cfg->max_seq_len = 2048;
     cfg->weight_type = GGUF_TYPE_F16;
+    cfg->head_dim = -1; // auto-calculate later if not set
     m->tok_bos_id = 1;
     m->tok_eos_id = 2;
 
@@ -232,33 +257,34 @@ static int parse_gguf(model_t *m, int max_seq_len) {
         gguf_str_t key = read_gguf_string(&r);
         uint32_t vtype = read_u32(&r);
 
-        if (str_eq(key, "llama.embedding_length") || str_eq(key, "general.embedding_length")) {
+       if (key_is(key, GKEY_EMBED_LEN)) {
             int dummy; cfg->n_embd = (int)skip_meta_value(&r, vtype, &dummy);
-        } else if (str_eq(key, "llama.feed_forward_length") || str_eq(key, "general.feed_forward_length")) {
+        } else if (key_is(key, GKEY_FFN_LEN)) {
             int dummy; cfg->n_ffn = (int)skip_meta_value(&r, vtype, &dummy);
-        } else if (str_eq(key, "llama.attention.head_count")) {
+        } else if (key_is(key, GKEY_HEAD_COUNT)) {
             int dummy; cfg->n_heads = (int)skip_meta_value(&r, vtype, &dummy);
-        } else if (str_eq(key, "llama.attention.head_count_kv")) {
+        } else if (key_is(key, GKEY_HEAD_COUNT_KV)) {
             int dummy; cfg->n_kv_heads = (int)skip_meta_value(&r, vtype, &dummy);
-        } else if (str_eq(key, "llama.block_count")) {
+        } else if (key_is(key, GKEY_BLOCK_COUNT)) {
             int dummy; cfg->n_layers = (int)skip_meta_value(&r, vtype, &dummy);
-        } else if (str_eq(key, "llama.context_length")) {
+        } else if (key_is(key, GKEY_CONTEXT_LEN)) {
             int dummy; cfg->max_seq_len = (int)skip_meta_value(&r, vtype, &dummy);
-        } else if (str_eq(key, "llama.rope.freq_base")) {
+        } else if (key_is(key, GKEY_ROPE_FREQ)) {
             if (vtype == GGUF_META_FLOAT32) {
                 cfg->rope_freq_base = read_f32(&r);
             } else {
-                int dummy; skip_meta_value(&r, vtype, &dummy);
+                int dummy; cfg->rope_freq_base = (float)skip_meta_value(&r, vtype, &dummy);
             }
-        } else if (str_eq(key, "general.alignment")) {
+        }
+       else if (key_is(key, GKEY_ALIGNMENT)) {
             int dummy; cfg->alignment = (int)skip_meta_value(&r, vtype, &dummy);
-        } else if (str_eq(key, "llama.vocab_size")) {
+        } else if (key_is(key, GKEY_VOCAB_SIZE)) {
             int dummy; cfg->vocab_size = (int)skip_meta_value(&r, vtype, &dummy);
-        } else if (str_eq(key, "tokenizer.ggml.bos_token_id")) {
+        } else if (key_is(key, GKEY_BOS_ID)) {
             int dummy; m->tok_bos_id = (uint32_t)skip_meta_value(&r, vtype, &dummy);
-        } else if (str_eq(key, "tokenizer.ggml.eos_token_id")) {
+        } else if (key_is(key, GKEY_EOS_ID)) {
             int dummy; m->tok_eos_id = (uint32_t)skip_meta_value(&r, vtype, &dummy);
-        } else if (str_eq(key, "tokenizer.ggml.tokens")) {
+        } else if (key_is(key, "tokenizer.ggml.tokens")) {
             if (vtype != GGUF_META_ARRAY) {
                 int dummy; skip_meta_value(&r, vtype, &dummy);
             } else {
@@ -271,7 +297,8 @@ static int parse_gguf(model_t *m, int max_seq_len) {
                     skip_meta_value(&r, arr_type, &dummy);
                 }
             }
-        } else if (str_eq(key, "tokenizer.ggml.scores")) {
+        } 
+       else if (key_is(key, "tokenizer.ggml.scores")) {
             if (vtype != GGUF_META_ARRAY) {
                 int dummy; skip_meta_value(&r, vtype, &dummy);
             } else {
@@ -282,15 +309,23 @@ static int parse_gguf(model_t *m, int max_seq_len) {
                 m->tok_n_scores = arr_len;
                 r.pos += arr_len * 4;
             }
-        } else {
+        }else if (key_is(key, GKEY_QK_NORM)) { // Qwen 3 的头维度（非对称头关键）
+            int dummy; cfg->head_dim = (int)skip_meta_value(&r, vtype, &dummy);
+        }
+         else {
             int dummy; skip_meta_value(&r, vtype, &dummy);
         }
+    }
+
+    if (m->tok_bos_id == 1 && cfg->vocab_size > 150000) {
+        m->tok_bos_id = 151643; // Qwen BOS
+        m->tok_eos_id = 151645; // Qwen EOS
     }
 
     if (max_seq_len > 0 && max_seq_len < cfg->max_seq_len) {
         cfg->max_seq_len = max_seq_len;
     }
-    cfg->head_dim = cfg->n_embd / cfg->n_heads;
+    if(cfg->head_dim<1)cfg->head_dim = cfg->n_embd / cfg->n_heads;
 
     /* Parse tensor info entries */
     typedef struct {
@@ -310,7 +345,7 @@ static int parse_gguf(model_t *m, int max_seq_len) {
         for (uint32_t d = 0; d < tinfos[i].n_dims; d++) {
             tinfos[i].dims[d] = read_u64(&r);
         }
-        tinfos[i].type   = read_u32(&r);
+        tinfos[i].type   = read_u32(&r)+1;
         tinfos[i].offset = read_u64(&r);
     }
 
@@ -354,6 +389,7 @@ static int parse_gguf(model_t *m, int max_seq_len) {
 
             if (layer >= 0 && layer < MAX_LAYERS) {
                 layer_weights_t *lw = &w->layers[layer];
+
                 if (strcmp(suffix, "attn_norm.weight") == 0) {
                     lw->attn_norm = ptr; lw->type_attn_norm = qtype;
                 } else if (strcmp(suffix, "attn_q.weight") == 0) {
@@ -372,6 +408,24 @@ static int parse_gguf(model_t *m, int max_seq_len) {
                     lw->ffn_down = ptr; lw->type_ffn_down = qtype;
                 } else if (strcmp(suffix, "ffn_up.weight") == 0) {
                     lw->ffn_up = ptr; lw->type_ffn_up = qtype;
+                }else if (strcmp(suffix, "attn_q.bias") == 0) {
+                    lw->attn_q_b = ptr; lw->type_attn_q_b = qtype;
+                } else if (strcmp(suffix, "attn_k.bias") == 0) {
+                    lw->attn_k_b = ptr; lw->type_attn_k_b = qtype;
+                } else if (strcmp(suffix, "attn_v.bias") == 0) {
+                    lw->attn_v_b = ptr; lw->type_attn_v_b = qtype;
+                } else if (strcmp(suffix, "attn_output.bias") == 0) {
+                    lw->attn_output_b = ptr; lw->type_attn_output_b = qtype;
+                } else if (strcmp(suffix, "ffn_gate.bias") == 0) {
+                    lw->ffn_gate_b = ptr; lw->type_ffn_gate_b = qtype;
+                } else if (strcmp(suffix, "ffn_down.bias") == 0) {
+                    lw->ffn_down_b = ptr; lw->type_ffn_down_b = qtype;
+                } else if (strcmp(suffix, "ffn_up.bias") == 0) {
+                    lw->ffn_up_b = ptr; lw->type_ffn_up_b = qtype;
+                }else if (strcmp(suffix, "attn_q_norm.weight") == 0) {
+                    lw->attn_q_norm = ptr; lw->type_attn_q_norm = qtype;
+                } else if (strcmp(suffix, "attn_k_norm.weight") == 0) {
+                    lw->attn_k_norm = ptr; lw->type_attn_k_norm = qtype;
                 }
             }
         }
@@ -432,18 +486,27 @@ static int allocate_run_state(model_t *m) {
     model_config_t *c = &m->config;
     run_state_t *s = &m->state;
 
+    int dim = c->n_embd;
+    int n_ffn = c->n_ffn;
     int kv_dim = c->n_kv_heads * c->head_dim;
     int half_dim = c->head_dim / 2;
+    int q_dim = c->n_heads * c->head_dim; // 8192
+    int max_scratch = (q_dim > c->n_ffn) ? q_dim : c->n_ffn;
 
     /* Calculate sizes for float buffers */
     size_t sz_x      = (size_t)c->n_embd * sizeof(float);
-    size_t sz_xb     = (size_t)c->n_embd * sizeof(float);
-    size_t sz_xb2    = (size_t)c->n_embd * sizeof(float);
-    size_t sz_q      = (size_t)c->n_embd * sizeof(float);
+    size_t sz_xb     = (size_t)max_scratch * sizeof(float);
+    size_t sz_xb2    = (size_t)max_scratch * sizeof(float);
+    //size_t sz_q      = (size_t)c->n_embd * sizeof(float);
+    size_t sz_q = (size_t)c->n_heads * c->head_dim * sizeof(float); 
     /* att buffer removed (flash attention) */
     size_t sz_hb     = (size_t)c->n_ffn * sizeof(float);
     size_t sz_hb2    = (size_t)c->n_ffn * sizeof(float);
     size_t sz_logits = (size_t)c->vocab_size * sizeof(float);
+    size_t bias_elements_per_layer = (size_t)dim + kv_dim + kv_dim + dim + n_ffn + n_ffn + dim;
+    size_t sz_all_biases = (size_t)c->n_layers * bias_elements_per_layer * sizeof(float);
+    size_t sz_qk_norm = (size_t)c->n_layers * 2 * c->head_dim * sizeof(float);
+
 
     int scratch_dim = c->n_embd > c->n_ffn ? c->n_embd : c->n_ffn;
     if (c->vocab_size > scratch_dim) scratch_dim = c->vocab_size;
@@ -458,7 +521,7 @@ static int allocate_run_state(model_t *m) {
 
     size_t total = sz_x + sz_xb + sz_xb2 + sz_q +
                    sz_hb + sz_hb2 + sz_logits +
-                   sz_scratch + sz_rope + sz_norm;
+                   sz_scratch + sz_rope + sz_norm + sz_all_biases + sz_qk_norm;
 
     /* FP16 KV cache: separate allocation */
     size_t kv_elements = (size_t)c->n_layers * c->max_seq_len * kv_dim;
@@ -469,6 +532,7 @@ static int allocate_run_state(model_t *m) {
             (double)sz_kv / (1024.0 * 1024.0));
 
     s->mem_block = calloc(1, total);
+    float *bp = (float *)((uint8_t*)s->mem_block + (total - sz_all_biases));
     if (!s->mem_block) {
         fprintf(stderr, "OOM: cannot allocate %zu bytes\n", total);
         return -1;
@@ -486,10 +550,11 @@ static int allocate_run_state(model_t *m) {
 
     /* Carve float pointers */
     float *p = (float *)s->mem_block;
+    q_dim = c->n_heads * c->head_dim;
     s->x      = p; p += c->n_embd;
-    s->xb     = p; p += c->n_embd;
-    s->xb2    = p; p += c->n_embd;
-    s->q      = p; p += c->n_embd;
+    s->xb     = p; p += max_scratch;
+    s->xb2    = p; p += max_scratch;
+    s->q      = p; p += q_dim;
     s->hb     = p; p += c->n_ffn;
     s->hb2    = p; p += c->n_ffn;
     s->logits = p; p += c->vocab_size;
@@ -511,25 +576,105 @@ static int allocate_run_state(model_t *m) {
     float *nw = s->norm_weights;
     for (int l = 0; l < c->n_layers; l++) {
         s->attn_norm_w[l] = nw;
-        dequantize_row(m->weights.layers[l].attn_norm, nw, c->n_embd,
-                       m->weights.layers[l].type_attn_norm);
+        if(m->weights.layers[l].type_attn_norm != GGUF_TYPE_NONE) {
+            dequantize_row(m->weights.layers[l].attn_norm, nw, c->n_embd,
+                           m->weights.layers[l].type_attn_norm);
+        }
         nw += c->n_embd;
 
         s->ffn_norm_w[l] = nw;
-        dequantize_row(m->weights.layers[l].ffn_norm, nw, c->n_embd,
-                       m->weights.layers[l].type_ffn_norm);
+        if(m->weights.layers[l].type_ffn_norm != GGUF_TYPE_NONE) {
+            dequantize_row(m->weights.layers[l].ffn_norm, nw, c->n_embd,
+                           m->weights.layers[l].type_ffn_norm);
+        }
         nw += c->n_embd;
     }
     s->output_norm_w = nw;
-    dequantize_row(m->weights.output_norm, nw, c->n_embd,
-                   m->weights.type_output_norm);
+    if(m->weights.type_output_norm != GGUF_TYPE_NONE) {
+        dequantize_row(m->weights.output_norm, nw, c->n_embd,
+                       m->weights.type_output_norm);
+    }
 
     /* Init tensor scratch */
     tensor_init_scratch(s->dequant_scratch, scratch_dim);
-
+    printf("Dequantization scratch buffer: %d floats\n", scratch_dim);
     /* Pre-compute RoPE tables (eliminates powf/cosf/sinf from hot path) */
     init_rope_tables(s, c);
+    for (int l = 0; l < c->n_layers; l++) {
+        layer_weights_t *lw = &m->weights.layers[l];
 
+        // Q Bias
+        s->attn_q_bias[l] = bp;
+        if (lw->attn_q_b && lw->type_attn_q_b != GGUF_TYPE_NONE) {
+            dequantize_row(lw->attn_q_b, bp, dim, lw->type_attn_q_b);
+        }
+        bp += dim;
+
+        // K Bias
+        s->attn_k_bias[l] = bp;
+        if (lw->attn_k_b && lw->type_attn_k_b != GGUF_TYPE_NONE) {
+            dequantize_row(lw->attn_k_b, bp, kv_dim, lw->type_attn_k_b);
+        }
+        bp += kv_dim;
+
+        // V Bias
+        s->attn_v_bias[l] = bp;
+        if (lw->attn_v_b && lw->type_attn_v_b != GGUF_TYPE_NONE) {
+            dequantize_row(lw->attn_v_b, bp, kv_dim, lw->type_attn_v_b);
+        }
+        bp += kv_dim;
+
+        // Output Bias
+        s->attn_output_bias[l] = bp;
+        if (lw->attn_output_b && lw->type_attn_output_b != GGUF_TYPE_NONE) {
+            dequantize_row(lw->attn_output_b, bp, dim, lw->type_attn_output_b);
+        }
+        bp += dim;
+
+        // FFN Gate Bias
+        s->ffn_gate_bias[l] = bp;
+        if (lw->ffn_gate_b && lw->type_ffn_gate_b != GGUF_TYPE_NONE) {
+            dequantize_row(lw->ffn_gate_b, bp, n_ffn, lw->type_ffn_gate_b);
+        }
+        bp += n_ffn;
+
+        // FFN Up Bias
+        s->ffn_up_bias[l] = bp;
+        if (lw->ffn_up_b && lw->type_ffn_up_b != GGUF_TYPE_NONE) {
+            dequantize_row(lw->ffn_up_b, bp, n_ffn, lw->type_ffn_up_b);
+        }
+        bp += n_ffn;
+
+        // FFN Down Bias
+        s->ffn_down_bias[l] = bp;
+        if (lw->ffn_down_b && lw->type_ffn_down_b != GGUF_TYPE_NONE) {
+            dequantize_row(lw->ffn_down_b, bp, dim, lw->type_ffn_down_b);
+        }
+        bp += dim;
+    }
+
+    p = (float *)((uint8_t*)s->mem_block + (total - sz_qk_norm));
+    //s->qk_norm_buf = p;
+    printf("Q/K norm buffer: %zu floats\n", (size_t)c->n_layers * 2 * c->head_dim);
+    // 5. 循环赋值并执行预反量化 (Pre-Dequantize)
+    float *curr_p = p; // s->qk_norm_buf;
+    for (int l = 0; l < c->n_layers; l++) {
+        layer_weights_t *lw = &m->weights.layers[l];
+
+        // 分配并反量化 Q-norm
+        s->attn_q_norm_w[l] = curr_p;
+        if (lw->attn_q_norm && lw->type_attn_q_norm != GGUF_TYPE_NONE) {
+            dequantize_row(lw->attn_q_norm, curr_p, c->head_dim, lw->type_attn_q_norm);
+        }
+        curr_p += c->head_dim;
+
+        // 分配并反量化 K-norm
+        s->attn_k_norm_w[l] = curr_p;
+        if (lw->attn_k_norm && lw->type_attn_k_norm != GGUF_TYPE_NONE) {
+            dequantize_row(lw->attn_k_norm, curr_p, c->head_dim, lw->type_attn_k_norm);
+        }
+        curr_p += c->head_dim;
+    }
     return 0;
 }
 
@@ -584,22 +729,45 @@ float *model_forward(model_t *m, int token, int pos) {
 
         /* ---- Attention ---- */
         rmsnorm(s->xb, s->x, s->attn_norm_w[l], dim);
+        int q_dim = n_heads * head_dim;
+        int kv_dim = n_kv_heads * head_dim; // 8 * 128 = 1024
 
         /* QKV projections */
-        matmul(s->q, s->xb, lw->attn_q, dim, dim, lw->type_attn_q);
-
+        // matmul(s->q, s->xb, lw->attn_q, dim, dim, lw->type_attn_q);
+        //matmul_bias(s->q, s->xb, lw->attn_q, lw->attn_q_b, dim, dim, lw->type_attn_q, lw->type_attn_q_b, s->dequant_scratch);
+        matmul_bias(s->q, s->xb, lw->attn_q, s->attn_q_bias[l], dim, q_dim, lw->type_attn_q, lw->type_attn_q_b, s->dequant_scratch);
         /* K and V: project into float temp, then store as FP16 in cache */
         float *k_tmp = s->xb2; /* reuse xb2 as temp for K (kv_dim <= dim) */
-        matmul(k_tmp, s->xb, lw->attn_k, dim, kv_dim, lw->type_attn_k);
-
+        // matmul(k_tmp, s->xb, lw->attn_k, dim, kv_dim, lw->type_attn_k);
+        //matmul_bias(k_tmp, s->xb, lw->attn_k, lw->attn_k_b, dim, kv_dim, lw->type_attn_k, lw->type_attn_k_b, s->dequant_scratch);
+        matmul_bias(k_tmp, s->xb, lw->attn_k, s->attn_k_bias[l], dim, kv_dim, lw->type_attn_k, lw->type_attn_k_b, s->dequant_scratch);
         /* Store K as FP16 */
         uint16_t *kcache_layer = s->key_cache + (size_t)l * seq_len * kv_dim;
         uint16_t *vcache_layer = s->val_cache + (size_t)l * seq_len * kv_dim;
         uint16_t *key_pos_fp16 = kcache_layer + (size_t)pos * kv_dim;
 
+        // --- 新增：QK-Norm 步骤 ---
+        // 对 Query 的每个头进行 Norm
+
+        if(lw->attn_q_norm && lw->type_attn_q_norm != GGUF_TYPE_NONE){
+            for (int h = 0; h < n_heads; h++) {
+                float* qh = s->q + h * head_dim;
+                rmsnorm(qh, qh, s->attn_q_norm_w[l], head_dim); // 对该头做 Norm
+            }
+        }
+
+        // 对 Key 的每个头进行 Norm (k_tmp 是临时的 float buffer)
+        if(lw->attn_k_norm && lw->type_attn_k_norm != GGUF_TYPE_NONE){
+            for (int h = 0; h < n_kv_heads; h++) {
+                float* kh = k_tmp + h * head_dim;
+                rmsnorm(kh, kh, s->attn_k_norm_w[l], head_dim);
+            }
+        }
+
+
         /* Apply RoPE to Q and K (using pre-computed tables) */
         rope(s->q, k_tmp, head_dim, n_heads, n_kv_heads, cos_pos, sin_pos);
-
+        
         /* Convert K to FP16 and store */
         for (int d = 0; d < kv_dim; d++) {
             key_pos_fp16[d] = fp32_to_fp16(k_tmp[d]);
@@ -607,7 +775,10 @@ float *model_forward(model_t *m, int token, int pos) {
 
         /* V projection -> store directly as FP16 */
         float *v_tmp = s->xb2;
-        matmul(v_tmp, s->xb, lw->attn_v, dim, kv_dim, lw->type_attn_v);
+        //matmul(v_tmp, s->xb, lw->attn_v, dim, kv_dim, lw->type_attn_v);
+        //matmul_bias(v_tmp, s->xb, lw->attn_v, lw->attn_v_b, dim, kv_dim, lw->type_attn_v, lw->type_attn_v_b, s->dequant_scratch);
+        matmul_bias(v_tmp, s->xb, lw->attn_v, s->attn_v_bias[l], dim, kv_dim, lw->type_attn_v, lw->type_attn_v_b, s->dequant_scratch);
+
         uint16_t *val_pos_fp16 = vcache_layer + (size_t)pos * kv_dim;
         for (int d = 0; d < kv_dim; d++) {
             val_pos_fp16[d] = fp32_to_fp16(v_tmp[d]);
@@ -680,19 +851,24 @@ float *model_forward(model_t *m, int token, int pos) {
         }
 
         /* Output projection */
-        matmul(s->xb2, s->xb, lw->attn_output, dim, dim, lw->type_attn_output);
+        q_dim = n_heads * head_dim; 
+        //matmul_bias(s->xb2, s->xb, lw->attn_output, s->attn_output_bias[l], q_dim, dim, lw->type_attn_output, lw->type_attn_output_b, s->dequant_scratch);
+        //matmul(s->xb2, s->xb, lw->attn_output, dim, dim, lw->type_attn_output);
+        matmul_bias(s->xb2, s->xb, lw->attn_output, s->attn_output_bias[l], q_dim, dim, lw->type_attn_output, lw->type_attn_output_b, s->dequant_scratch);
         vec_add(s->x, s->xb2, dim);
 
         /* ---- FFN (SwiGLU) ---- */
         rmsnorm(s->xb, s->x, s->ffn_norm_w[l], dim);
 
-        matmul(s->hb,  s->xb, lw->ffn_gate, dim, n_ffn, lw->type_ffn_gate);
-        matmul(s->hb2, s->xb, lw->ffn_up,   dim, n_ffn, lw->type_ffn_up);
-
+        // matmul(s->hb,  s->xb, lw->ffn_gate, dim, n_ffn, lw->type_ffn_gate);
+        // matmul(s->hb2, s->xb, lw->ffn_up,   dim, n_ffn, lw->type_ffn_up);
+        matmul_bias(s->hb,  s->xb, lw->ffn_gate, lw->ffn_gate_b, dim, n_ffn, lw->type_ffn_gate, lw->type_ffn_gate_b, s->dequant_scratch);
+matmul_bias(s->hb2, s->xb, lw->ffn_up,   lw->ffn_up_b,   dim, n_ffn, lw->type_ffn_up,   lw->type_ffn_up_b,   s->dequant_scratch);
         silu(s->hb, n_ffn);
         elemwise_mul(s->hb, s->hb, s->hb2, n_ffn);
 
-        matmul(s->xb, s->hb, lw->ffn_down, n_ffn, dim, lw->type_ffn_down);
+        //matmul(s->xb, s->hb, lw->ffn_down, n_ffn, dim, lw->type_ffn_down);
+        matmul_bias(s->xb, s->hb, lw->ffn_down, lw->ffn_down_b, n_ffn, dim, lw->type_ffn_down, lw->type_ffn_down_b, s->dequant_scratch);
         vec_add(s->x, s->xb, dim);
     }
 

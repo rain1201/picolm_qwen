@@ -34,6 +34,10 @@ typedef struct {
     const void *attn_q;
     const void *attn_k;
     const void *attn_v;
+    // 新增：Bias 指针
+    const void *attn_q_b, *attn_k_b, *attn_v_b, *attn_output_b;
+    const void *ffn_gate_b, *ffn_down_b, *ffn_up_b;
+    const void *attn_q_norm, *attn_k_norm;
     const void *attn_output;
     const void *ffn_norm;
     const void *ffn_gate;
@@ -49,6 +53,9 @@ typedef struct {
     gguf_type_t type_ffn_gate;
     gguf_type_t type_ffn_down;
     gguf_type_t type_ffn_up;
+    gguf_type_t type_attn_q_b, type_attn_k_b, type_attn_v_b, type_attn_output_b;
+    gguf_type_t type_ffn_gate_b, type_ffn_down_b, type_ffn_up_b;
+    gguf_type_t type_attn_q_norm, type_attn_k_norm;
 } layer_weights_t;
 
 typedef struct {
@@ -73,6 +80,7 @@ typedef struct {
     float *hb2;          /* FFN hidden buffer 2 [n_ffn] */
     float *logits;       /* output logits [vocab_size] */
 
+
     /* KV cache stored as FP16 to halve memory (22 MB -> 11 MB for TinyLlama) */
     uint16_t *key_cache;    /* [n_layers * max_seq_len * n_kv_heads * head_dim] as FP16 */
     uint16_t *val_cache;    /* [n_layers * max_seq_len * n_kv_heads * head_dim] as FP16 */
@@ -87,8 +95,16 @@ typedef struct {
     float *norm_weights;
     float *attn_norm_w[MAX_LAYERS];
     float *ffn_norm_w[MAX_LAYERS];
+    float *attn_q_bias[MAX_LAYERS];
+    float *attn_k_bias[MAX_LAYERS];
+    float *attn_v_bias[MAX_LAYERS];
+    float *attn_output_bias[MAX_LAYERS];
+    float *ffn_gate_bias[MAX_LAYERS];
+    float *ffn_up_bias[MAX_LAYERS];
+    float *ffn_down_bias[MAX_LAYERS];
     float *output_norm_w;
-
+    float *attn_q_norm_w[MAX_LAYERS]; // 新增反量化后的 QK-Norm 权重缓存
+    float *attn_k_norm_w[MAX_LAYERS];
     /* Single allocation base */
     void *mem_block;
     size_t mem_size;
