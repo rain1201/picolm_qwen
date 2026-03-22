@@ -104,7 +104,17 @@ int tokenizer_load(tokenizer_t *t, const model_t *m) {
     return 0;
 }
 
-int tokenizer_encode(const tokenizer_t *t, const char *text, int *tokens, int max_tokens, int add_bos) {
+/*int tokenizer_encode(encode_ptr func, const tokenizer_t *t, const char *text, int *tokens, int max_tokens, int add_bos) {
+    if (!func) return 0;
+    return func(t, text, tokens, max_tokens, add_bos);
+}
+
+const char* tokenizer_decode(decode_ptr func, const tokenizer_t *t, int prev_token, int token) {
+    if (!func) return NULL;
+    return func(t, prev_token, token);
+}*/
+
+int tokenizer_encode_llama(const tokenizer_t *t, const char *text, int *tokens, int max_tokens, int add_bos) {
     int n_tokens = 0;
 
     if (add_bos && n_tokens < max_tokens) {
@@ -123,15 +133,15 @@ int tokenizer_encode(const tokenizer_t *t, const char *text, int *tokens, int ma
     int norm_len = 0;
 
     /* Add leading ▁ */
-    //norm[norm_len++] = (char)0xE2;
-    //norm[norm_len++] = (char)0x96;
-    //norm[norm_len++] = (char)0x81;
+    norm[norm_len++] = (char)0xE2;
+    norm[norm_len++] = (char)0x96;
+    norm[norm_len++] = (char)0x81;
 
     for (int i = 0; i < text_len; i++) {
         if (text[i] == ' ') {
-            //norm[norm_len++] = (char)0xE2;
-            //norm[norm_len++] = (char)0x96;
-            //norm[norm_len++] = (char)0x81;
+            norm[norm_len++] = (char)0xE2;
+            norm[norm_len++] = (char)0x96;
+            norm[norm_len++] = (char)0x81;
         } else {
             norm[norm_len++] = text[i];
         }
@@ -220,7 +230,118 @@ int tokenizer_encode(const tokenizer_t *t, const char *text, int *tokens, int ma
     return n_tokens;
 }
 
-const char *tokenizer_decode(const tokenizer_t *t, int prev_token, int token) {
+
+int tokenizer_encode_qwen(const tokenizer_t *t, const char *text, int *tokens, int max_tokens, int add_bos) {
+    int n_tokens = 0;
+
+    if (add_bos && n_tokens < max_tokens) {
+        tokens[n_tokens++] = (int)t->bos_id;
+    }
+
+    if (!text || !*text) return n_tokens;
+
+    /* SentencePiece convention: replace spaces with ▁ (U+2581, UTF-8: E2 96 81)
+     * and prepend ▁ at the start of the text.
+     * Build a normalized copy: " Once upon a time" → "▁Once▁upon▁a▁time" */
+    int text_len = (int)strlen(text);
+    /* Worst case: every byte is a space → 3x expansion, plus leading ▁ */
+    int norm_cap = text_len * 3 + 4;
+    char *norm = (char *)malloc((size_t)norm_cap);
+    int norm_len = 0;
+
+    
+
+    for (int i = 0; i < text_len; i++) {
+        if (text[i] == ' ') {
+        } else {
+            norm[norm_len++] = text[i];
+        }
+    }
+    norm[norm_len] = '\0';
+
+    /* Step 1: Convert normalized text to individual character tokens.
+     * Each UTF-8 character (including ▁) gets looked up in the vocab. */
+    /* Worst case: one token per byte of normalized text */
+    int *merge_buf = (int *)malloc((size_t)(norm_len + 1) * sizeof(int));
+    int merge_len = 0;
+
+    for (int i = 0; i < norm_len; ) {
+        /* Determine UTF-8 character length */
+        int clen = 1;
+        unsigned char c = (unsigned char)norm[i];
+        if (c >= 0xF0) clen = 4;
+        else if (c >= 0xE0) clen = 3;
+        else if (c >= 0xC0) clen = 2;
+
+        if (i + clen > norm_len) clen = norm_len - i;
+
+        /* Try to find this character in vocab */
+        int tok = vocab_lookup(t, norm + i, clen);
+        if (tok >= 0) {
+            merge_buf[merge_len++] = tok;
+            i += clen;
+        } else {
+            /* Fall back to byte tokens: <0xHH> */
+            char byte_tok[8];
+            snprintf(byte_tok, sizeof(byte_tok), "<0x%02X>", (unsigned char)norm[i]);
+            tok = vocab_lookup(t, byte_tok, (int)strlen(byte_tok));
+            if (tok >= 0) {
+                merge_buf[merge_len++] = tok;
+            }
+            i++;
+        }
+    }
+    free(norm);
+
+    /* Step 2: BPE merge loop — iteratively find best adjacent pair */
+    while (merge_len >= 2) {
+        float best_score = -1e30f;
+        int best_idx = -1;
+        int best_tok = -1;
+
+        for (int i = 0; i < merge_len - 1; i++) {
+            /* Build the merged string */
+            const char *s1 = t->vocab[merge_buf[i]];
+            const char *s2 = t->vocab[merge_buf[i + 1]];
+            int l1 = (int)strlen(s1);
+            int l2 = (int)strlen(s2);
+
+            /* Build concatenation in stack buffer */
+            char merged[256];
+            if (l1 + l2 >= (int)sizeof(merged)) continue;
+            memcpy(merged, s1, (size_t)l1);
+            memcpy(merged + l1, s2, (size_t)l2);
+            merged[l1 + l2] = '\0';
+
+            int tok = vocab_lookup(t, merged, l1 + l2);
+            if (tok >= 0 && t->scores[tok] > best_score) {
+                best_score = t->scores[tok];
+                best_idx = i;
+                best_tok = tok;
+            }
+        }
+
+        if (best_idx < 0) break; /* no more merges possible */
+
+        /* Apply the merge */
+        merge_buf[best_idx] = best_tok;
+        /* Shift left */
+        for (int i = best_idx + 1; i < merge_len - 1; i++) {
+            merge_buf[i] = merge_buf[i + 1];
+        }
+        merge_len--;
+    }
+
+    /* Copy to output */
+    for (int i = 0; i < merge_len && n_tokens < max_tokens; i++) {
+        tokens[n_tokens++] = merge_buf[i];
+    }
+
+    free(merge_buf);
+    return n_tokens;
+}
+
+const char *tokenizer_decode_qwen(const tokenizer_t *t, int prev_token, int token) {
     if (token < 0 || token >= t->vocab_size) return "";
 
     const char *str = t->vocab[token];
@@ -257,7 +378,7 @@ const char *tokenizer_decode(const tokenizer_t *t, int prev_token, int token) {
     return clean_buf;
 }
 
-const char *tokenizer_decode_ori(const tokenizer_t *t, int prev_token, int token) {
+const char *tokenizer_decode_llama(const tokenizer_t *t, int prev_token, int token) {
     if (token < 0 || token >= t->vocab_size) return "";
 
     const char *str = t->vocab[token];

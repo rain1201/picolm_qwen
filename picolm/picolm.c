@@ -165,9 +165,18 @@ int main(int argc, char **argv) {
     }
 
     /* Encode prompt */
+    encode_ptr tokenizer_encoder = NULL;
+    decode_ptr tokenizer_decoder = NULL;
+    if(strstr(model_path, "wen") != NULL) {// crude check for "qwen" in model name to select tokenizer
+        tokenizer_encoder = tokenizer_encode_qwen;
+        tokenizer_decoder = tokenizer_decode_qwen;
+    } else {
+        tokenizer_encoder = tokenizer_encode_llama;
+        tokenizer_decoder = tokenizer_decode_llama;
+    }
     int max_prompt_tokens = (int)strlen(prompt) + 3;
     int *prompt_tokens = (int *)malloc((size_t)max_prompt_tokens * sizeof(int));
-    int n_prompt = tokenizer_encode(&tokenizer, prompt, prompt_tokens, max_prompt_tokens, 1);
+    int n_prompt = tokenizer_encoder(&tokenizer, prompt, prompt_tokens, max_prompt_tokens, 1);
 
     /* If cache covers part of the prompt, skip those positions */
     int start_pos = 0;
@@ -220,7 +229,7 @@ int main(int argc, char **argv) {
             grammar_advance(&grammar, &tokenizer, next);
 
             /* Decode and print */
-            const char *piece = tokenizer_decode(&tokenizer, token, next);
+            const char *piece = tokenizer_decoder(&tokenizer, token, next);
             printf("[%d]", next);
             printf("%s", piece);
             fflush(stdout);
