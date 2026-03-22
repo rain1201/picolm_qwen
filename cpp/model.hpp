@@ -4,6 +4,7 @@
 #include "quant.hpp"
 #include "tensor.hpp"
 #include "tokenizer.hpp"
+#include "prefetcher.hpp"
 #include <cstdint>
 #include <cstring>
 #include <vector>
@@ -35,6 +36,7 @@ struct ModelConfig {
     float rope_freq_base = 10000.0f;
     int alignment = 32;
     GGUFType weight_type = GGUFType::F16;
+    bool use_prefetch = false;
 };
 
 struct LayerWeights {
@@ -129,13 +131,14 @@ struct Model {
 
     ~Model() { free(); }
 
-    int load(const char* path, int max_seq_len_override = 0) {
+    int load(const char* path, int max_seq_len_override = 0, bool prefetch = false) {
         weights = ModelWeights();  // Zero-initialize
-        
+        config.use_prefetch = prefetch;
+
         if (mmap_file(path) != 0) return -1;
         if (parse_gguf(max_seq_len_override) != 0) return -1;
         if (allocate_run_state() != 0) return -1;
-        
+
         return 0;
     }
 
@@ -163,6 +166,21 @@ struct Model {
         // 2. Transformer layers
         for (int l = 0; l < config.n_layers; l++) {
             LayerWeights* lw = &weights.layers[l];
+            
+            // 预取下一层的数据 (使用操作系统 API 实现计算与 I/O 重叠)
+            if (config.use_prefetch && l + 1 < config.n_layers) {
+                LayerWeights* next_lw = &weights.layers[l + 1];
+                // 估算每层权重的大小 (量化后约 2-4 bits per weight)
+                size_t attn_size = (size_t)dim * (size_t)q_dim / 4;
+                size_t ffn_size = (size_t)dim * (size_t)n_ffn / 4;
+                MemoryPrefetcher::prefetch_layer(next_lw->attn_q, attn_size);
+                MemoryPrefetcher::prefetch_layer(next_lw->attn_k, attn_size);
+                MemoryPrefetcher::prefetch_layer(next_lw->attn_v, attn_size);
+                MemoryPrefetcher::prefetch_layer(next_lw->attn_output, attn_size);
+                MemoryPrefetcher::prefetch_layer(next_lw->ffn_gate, ffn_size);
+                MemoryPrefetcher::prefetch_layer(next_lw->ffn_up, ffn_size);
+                MemoryPrefetcher::prefetch_layer(next_lw->ffn_down, ffn_size);
+            }
 
             // Attention
             TensorOps::rmsnorm(state.xb.data(), state.x.data(), state.attn_norm_w[l].data(), dim);

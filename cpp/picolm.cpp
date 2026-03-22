@@ -35,6 +35,8 @@ void usage(const char* prog) {
     std::cerr << "  -s <int>       RNG seed (default: 42)\n";
     std::cerr << "  -c <int>       Context length override\n";
     std::cerr << "  -j <int>       Number of threads (default: 4)\n";
+    std::cerr << "\nOptimization options:\n";
+    std::cerr << "  --prefetch     Enable layer prefetching (may improve performance on some systems)\n";
 }
 
 int main(int argc, char** argv) {
@@ -51,6 +53,7 @@ int main(int argc, char** argv) {
     uint64_t seed = 42;
     int context_override = 0;
     int num_threads = 4;
+    bool enable_prefetch = false;
 
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
@@ -67,6 +70,8 @@ int main(int argc, char** argv) {
             context_override = atoi(argv[++i]);
         } else if (strcmp(argv[i], "-j") == 0 && i + 1 < argc) {
             num_threads = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--prefetch") == 0) {
+            enable_prefetch = true;
         } else {
             std::cerr << "Unknown option: " << argv[i] << "\n";
             usage(argv[0]);
@@ -83,7 +88,7 @@ int main(int argc, char** argv) {
     // Load model
     std::cerr << "Loading model: " << model_path << "\n";
     Model model;
-    if (model.load(model_path, context_override) != 0) {
+    if (model.load(model_path, context_override, enable_prefetch) != 0) {
         std::cerr << "Failed to load model\n";
         return 1;
     }
@@ -118,8 +123,9 @@ int main(int argc, char** argv) {
     tokenizer.encode_qwen(prompt, prompt_tokens, true);
     int n_prompt = (int)prompt_tokens.size();
 
-    std::cerr << "Prompt: " << n_prompt << " tokens, generating up to " << max_tokens 
-              << " (temp=" << temperature << ", top_p=" << top_p << ", threads=" << num_threads << ")\n";
+    std::cerr << "Prompt: " << n_prompt << " tokens, generating up to " << max_tokens
+              << " (temp=" << temperature << ", top_p=" << top_p << ", threads=" << num_threads
+              << ", prefetch=" << (enable_prefetch ? "on" : "off") << ")\n";
     std::cerr << "---\n";
 
     // Generation loop
