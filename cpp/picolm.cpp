@@ -5,6 +5,7 @@
 #include <vector>
 #include <cstring>
 #include <chrono>
+#include <clocale>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -37,9 +38,27 @@ void usage(const char* prog) {
     std::cerr << "  -j <int>       Number of threads (default: 4)\n";
     std::cerr << "\nOptimization options:\n";
     std::cerr << "  --prefetch     Enable layer prefetching (may improve performance on some systems)\n";
+    std::cerr << "\nNote: UTF-8/Chinese input is fully supported.\n";
+    std::cerr << "      On Windows, use: chcp 65001 before running for best compatibility.\n";
 }
 
 int main(int argc, char** argv) {
+    // UTF-8 支持：设置 C 运行时本地化为 UTF-8
+    std::setlocale(LC_ALL, ".UTF-8");
+
+#ifdef _WIN32
+    // Windows: 强制控制台代码页为 UTF-8
+    SetConsoleOutputCP(65001);
+    SetConsoleCP(65001);
+    // powershell -Command "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; 'Hello' | picolm.exe model.gguf -n 50"
+    // 启用虚拟终端处理
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    DWORD dwMode = 0;
+    if (GetConsoleMode(hOut, &dwMode)) {
+        SetConsoleMode(hOut, dwMode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+    }
+#endif
+
     if (argc < 2) {
         usage(argv[0]);
         return 1;
@@ -76,6 +95,32 @@ int main(int argc, char** argv) {
             std::cerr << "Unknown option: " << argv[i] << "\n";
             usage(argv[0]);
             return 1;
+        }
+    }
+
+    if (!prompt || !*prompt) {
+        // 尝试从 stdin 读取 prompt
+        static std::string stdin_prompt;
+        char buffer[256];
+        while (fgets(buffer, sizeof(buffer), stdin)) {
+            stdin_prompt += buffer;
+        }
+        if (!stdin_prompt.empty()) {
+            // 移除 UTF-8 BOM (如果存在)
+            size_t start = 0;
+            if (stdin_prompt.size() >= 3 && 
+                (unsigned char)stdin_prompt[0] == 0xEF && 
+                (unsigned char)stdin_prompt[1] == 0xBB && 
+                (unsigned char)stdin_prompt[2] == 0xBF) {
+                start = 3;
+            }
+            stdin_prompt = stdin_prompt.substr(start);
+            
+            // 移除末尾空白字符
+            while (!stdin_prompt.empty() && (stdin_prompt.back() == '\n' || stdin_prompt.back() == '\r' || stdin_prompt.back() == ' ')) {
+                stdin_prompt.pop_back();
+            }
+            prompt = stdin_prompt.c_str();
         }
     }
 
@@ -151,8 +196,8 @@ int main(int argc, char** argv) {
             next = sampler.sample(logits, model.config.vocab_size);
 
             const char* piece = tokenizer.decode_qwen(next);
-            printf("[%d]", next);
-            printf("%s", piece);
+            // 使用 fwrite 直接输出字节，避免 UTF-8 字节碎片问题
+            fwrite(piece, 1, strlen(piece), stdout);
             fflush(stdout);
 
             total_gen++;

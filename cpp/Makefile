@@ -1,5 +1,5 @@
 CXX      = g++
-CXXFLAGS = -O3 -std=c++17 -march=native -D_GNU_SOURCE -Wall -Wextra
+CXXFLAGS = -O3 -std=c++17 -march=native -D_GNU_SOURCE -finput-charset=UTF-8 -fexec-charset=UTF-8 -Wall -Wextra
 LDFLAGS  = -lm -lpthread -static-libgcc -static-libstdc++
 SRCS     = picolm.cpp
 TARGET   = picolm

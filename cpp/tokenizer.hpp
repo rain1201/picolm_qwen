@@ -151,27 +151,14 @@ struct Tokenizer {
     const char* decode_qwen(int token) const {
         if (token < 0 || token >= vocab_size) return "";
         const std::string& str = vocab[token];
+        
         static thread_local std::string clean_buf;
         clean_buf.clear();
 
         for (size_t i = 0; i < str.size(); i++) {
             unsigned char c = (unsigned char)str[i];
-            // Handle Qwen byte-level BPE mapping
-            // Ġ (U+0100 = C4 A0 in UTF-8) -> space
-            if (c == 0xC4 && i + 1 < str.size()) {
-                if ((unsigned char)str[i+1] == 0xA0) {
-                    clean_buf += ' ';
-                    i++;
-                    continue;
-                }
-                // Ċ (U+010A = C4 8A in UTF-8) -> newline  
-                if ((unsigned char)str[i+1] == 0x8A) {
-                    clean_buf += '\n';
-                    i++;
-                    continue;
-                }
-            }
-            // Handle byte tokens <0xHH>
+            
+            // 1. 处理字节级 BPE 转义符 <0xXX>
             if (c == '<' && i + 5 < str.size() && str[i+1] == '0' && str[i+2] == 'x') {
                 unsigned int val = 0;
                 if (sscanf(str.c_str() + i, "<0x%02X>", &val) == 1) {
@@ -180,7 +167,17 @@ struct Tokenizer {
                     continue;
                 }
             }
-            // Regular character - check if it's a multi-byte UTF-8
+            
+            // 2. 处理 Qwen 特有的字节映射 (Ġ -> 空格，Ċ -> 换行)
+            // 'Ġ' (U+0100 = C4 A0 in UTF-8) -> space
+            // 'Ċ' (U+010A = C4 8A in UTF-8) -> newline
+            if (c == 0xC4 && i + 1 < str.size()) {
+                unsigned char next_c = (unsigned char)str[i+1];
+                if (next_c == 0xA0) { clean_buf += ' '; i++; continue; }
+                if (next_c == 0x8A) { clean_buf += '\n'; i++; continue; }
+            }
+
+            // 3. 直接透传原始 UTF-8 字节 (支持中文等多字节字符)
             clean_buf += str[i];
         }
         return clean_buf.c_str();
