@@ -218,8 +218,33 @@ void softmax(float *x, int size) {
 #endif
 }
 
+void rope_qwen(float *q, float *k, int head_dim, int n_heads, int n_kv_heads,
+          const float *cos_pos, const float *sin_pos) {
+    int half = head_dim / 2; // Qwen 3 是 64
+
+    for (int h = 0; h < n_heads; h++) {
+        float *qh = q + h * head_dim;
+        for (int i = 0; i < half; i++) {
+            float q0 = qh[i];        // 前半部分
+            float q1 = qh[i + half]; // 后半部分
+            qh[i]        = q0 * cos_pos[i] - q1 * sin_pos[i];
+            qh[i + half] = q0 * sin_pos[i] + q1 * cos_pos[i];
+        }
+    }
+
+    for (int h = 0; h < n_kv_heads; h++) {
+        float *kh = k + h * head_dim;
+        for (int i = 0; i < half; i++) {
+            float k0 = kh[i];
+            float k1 = kh[i + half];
+            kh[i]        = k0 * cos_pos[i] - k1 * sin_pos[i];
+            kh[i + half] = k0 * sin_pos[i] + k1 * cos_pos[i];
+        }
+    }
+}
+
 /* Rotary position encoding using pre-computed cos/sin tables */
-void rope(float *q, float *k, int head_dim, int n_heads, int n_kv_heads,
+void rope_llama(float *q, float *k, int head_dim, int n_heads, int n_kv_heads,
           const float *cos_pos, const float *sin_pos) {
     int half = head_dim / 2;
 

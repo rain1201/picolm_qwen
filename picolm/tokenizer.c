@@ -230,8 +230,140 @@ int tokenizer_encode_llama(const tokenizer_t *t, const char *text, int *tokens, 
     return n_tokens;
 }
 
+/* 辅助函数：对不含特殊 Token 的纯文本片段进行 BPE 编码 */
+static int encode_bpe_segment(const tokenizer_t *t, const char *text, int len, int *tokens, int max_tokens) {
+    if (len <= 0) return 0;
+
+    /* Step 1: 初始切分为单字符 Token 或 字节 Token */
+    int *merge_buf = (int *)malloc((size_t)(len + 1) * sizeof(int));
+    int merge_len = 0;
+
+    for (int i = 0; i < len; ) {
+        int clen = 1;
+        unsigned char c = (unsigned char)text[i];
+        if (c >= 0xF0) clen = 4;
+        else if (c >= 0xE0) clen = 3;
+        else if (c >= 0xC0) clen = 2;
+        if (i + clen > len) clen = len - i;
+
+        int tok = vocab_lookup(t, text + i, clen);
+        if (tok >= 0) {
+            merge_buf[merge_len++] = tok;
+            i += clen;
+        } else {
+            /* Qwen 的词表通常包含所有单字节 token，如 <0xXX> */
+            char byte_tok[8];
+            snprintf(byte_tok, sizeof(byte_tok), "<0x%02X>", (unsigned char)text[i]);
+            tok = vocab_lookup(t, byte_tok, (int)strlen(byte_tok));
+            if (tok >= 0) merge_buf[merge_len++] = tok;
+            i++;
+        }
+    }
+
+    /* Step 2: BPE 合并循环 */
+    while (merge_len >= 2) {
+        float best_score = -1e30f;
+        int best_idx = -1;
+        int best_tok = -1;
+
+        for (int i = 0; i < merge_len - 1; i++) {
+            const char *s1 = t->vocab[merge_buf[i]];
+            const char *s2 = t->vocab[merge_buf[i + 1]];
+            int l1 = (int)strlen(s1);
+            int l2 = (int)strlen(s2);
+
+            char merged[512]; /* Qwen 的词条可能较长 */
+            if (l1 + l2 >= (int)sizeof(merged)) continue;
+            memcpy(merged, s1, (size_t)l1);
+            memcpy(merged + l1, s2, (size_t)l2);
+            merged[l1 + l2] = '\0';
+
+            int tok = vocab_lookup(t, merged, l1 + l2);
+            if (tok >= 0 && t->scores[tok] > best_score) {
+                best_score = t->scores[tok];
+                best_idx = i;
+                best_tok = tok;
+            }
+        }
+
+        if (best_idx < 0) break;
+        merge_buf[best_idx] = best_tok;
+        for (int i = best_idx + 1; i < merge_len - 1; i++) merge_buf[i] = merge_buf[i + 1];
+        merge_len--;
+    }
+
+    int count = (merge_len < max_tokens) ? merge_len : max_tokens;
+    for (int i = 0; i < count; i++) tokens[i] = merge_buf[i];
+    
+    free(merge_buf);
+    return count;
+}
 
 int tokenizer_encode_qwen(const tokenizer_t *t, const char *text, int *tokens, int max_tokens, int add_bos) {
+    int n_tokens = 0;
+
+    /* Qwen 通常不需要显式的 BOS，但如果设置了则添加 */
+    if (add_bos && n_tokens < max_tokens) {
+        tokens[n_tokens++] = (int)t->bos_id;
+    }
+
+    if (!text || !*text) return n_tokens;
+
+    /* Qwen 常见的特殊 Token 列表 */
+    const char *specials[] = {
+        "<|im_start|>", "<|im_end|>", "<|endoftext|>", 
+        "<|extra_0|>", "<|extra_1|>", "<|extra_2|>", "<|extra_3|>"
+    };
+    int n_specials = sizeof(specials) / sizeof(specials[0]);
+
+    const char *curr = text;
+    while (*curr && n_tokens < max_tokens) {
+        int special_id = -1;
+        int special_len = 0;
+
+        /* 1. 尝试在当前位置匹配特殊 Token */
+        for (int i = 0; i < n_specials; i++) {
+            int slen = (int)strlen(specials[i]);
+            if (strncmp(curr, specials[i], (size_t)slen) == 0) {
+                int id = vocab_lookup(t, specials[i], slen);
+                if (id != -1) {
+                    special_id = id;
+                    special_len = slen;
+                    break;
+                }
+            }
+        }
+
+        if (special_id != -1) {
+            /* 匹配成功：直接存入 ID，跳过 BPE */
+            tokens[n_tokens++] = special_id;
+            curr += special_len;
+        } else {
+            /* 2. 匹配失败：寻找直到下一个特殊 Token 之前的普通文本 */
+            const char *next_special = NULL;
+            for (const char *p = curr + 1; *p; p++) {
+                for (int i = 0; i < n_specials; i++) {
+                    if (strncmp(p, specials[i], strlen(specials[i])) == 0) {
+                        next_special = p;
+                        break;
+                    }
+                }
+                if (next_special) break;
+            }
+
+            int seg_len = next_special ? (int)(next_special - curr) : (int)strlen(curr);
+            
+            /* 对这段普通文本进行 BPE 编码 */
+            int added = encode_bpe_segment(t, curr, seg_len, tokens + n_tokens, max_tokens - n_tokens);
+            n_tokens += added;
+            curr += seg_len;
+        }
+    }
+
+    return n_tokens;
+}
+
+int tokenizer_encode_qwen_o(const tokenizer_t *t, const char *text, int *tokens, int max_tokens, int add_bos) {
     int n_tokens = 0;
 
     if (add_bos && n_tokens < max_tokens) {

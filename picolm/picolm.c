@@ -61,6 +61,108 @@ static char *read_stdin(void) {
     return buf;
 }
 
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+// 假设这些函数已经在你的 main.c 或头文件中声明
+// float *model_forward(model_t *m, int token, int pos);
+// int sampler_sample(sampler_t *s, float *logits, int vocab_size);
+// const char *tokenizer_decode_qwen(const tokenizer_t *t, int prev_token, int token);
+// int tokenizer_encode_qwen(const tokenizer_t *t, const char *text, int *tokens, int max_tokens, int add_bos);
+
+void run_chat_mode(model_t *model, tokenizer_t *tokenizer, sampler_t *sampler) {
+    int pos = 0;
+    int next_token;
+    char input_buf[2048];
+    int max_context = model->config.max_seq_len;
+
+    printf("\n--- Entering Chat Mode (Qwen 3) ---\n");
+    printf("Type 'exit' to quit, 'clear' to reset context.\n\n");
+
+    // 可选：添加 System Prompt 初始化
+    const char* system_prompt = "<|im_start|>system\nYou are Qwen, a helpful assistant.<|im_end|>\n";
+    int initial_tokens[128];
+    int n_system = tokenizer_encode_qwen(tokenizer, system_prompt, initial_tokens, 128, 1);
+    for (int i = 0; i < n_system; i++) {
+        model_forward(model, initial_tokens[i], pos++);
+    }
+
+    while (pos < max_context) {
+        printf("User: ");
+        if (!fgets(input_buf, sizeof(input_buf), stdin)) break;
+
+        // 处理特殊命令
+        input_buf[strcspn(input_buf, "\n")] = 0; // 移除换行符
+        if (strcmp(input_buf, "exit") == 0) break;
+        if (strcmp(input_buf, "clear") == 0) {
+            pos = 0;
+            printf("\n[Context Cleared]\n\n");
+            // 重新添加 System Prompt
+            n_system = tokenizer_encode_qwen(tokenizer, system_prompt, initial_tokens, 128, 1);
+            for (int i = 0; i < n_system; i++) model_forward(model, initial_tokens[i], pos++);
+            continue;
+        }
+
+        // 1. 构造本轮 User 输入的 ChatML 格式
+        char formatted_input[2560];
+        snprintf(formatted_input, sizeof(formatted_input), "<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n", input_buf);
+
+        // 2. 编码本轮 Prompt
+        int *prompt_tokens = malloc(sizeof(int) * strlen(formatted_input));
+        // 注意：追加对话时不添加 BOS (add_bos = 0)
+        int n_prompt = tokenizer_encode_qwen(tokenizer, formatted_input, prompt_tokens, (int)strlen(formatted_input), 0);
+
+        // 3. Prefill 阶段：喂入 User Prompt 并更新 KV Cache
+        // 我们处理到倒数第二个 token，最后一个用于触发生成
+        for (int i = 0; i < n_prompt - 1; i++) {
+            model_forward(model, prompt_tokens[i], pos++);
+            if (pos >= max_context) break;
+        }
+
+        int current_token = prompt_tokens[n_prompt - 1];
+        free(prompt_tokens);
+
+        if (pos >= max_context) {
+            printf("\n[Error: Context full]\n");
+            break;
+        }
+
+        // 4. Generation 阶段：助手生成回复
+        printf("Assistant: ");
+        int gen_tokens = 0;
+        
+        while (pos < max_context) {
+            float *logits = model_forward(model, current_token, pos);
+            
+            // 采样
+            next_token = sampler_sample(sampler, logits, model->config.vocab_size);
+            pos++;
+
+            // 检查停止词：Qwen 3 的 <|im_end|> 是 151645
+            if (next_token == tokenizer->eos_id || next_token == 151645) {
+                printf("\n");
+                break;
+            }
+
+            // 解码并实时打印
+            const char *piece = tokenizer_decode_qwen(tokenizer, current_token, next_token);
+            printf("%s", piece);
+            fflush(stdout);
+
+            current_token = next_token;
+            gen_tokens++;
+
+            // 设置一个硬上限防止无限生成
+            if (gen_tokens > 1024) break;
+        }
+        
+        if (pos >= max_context) {
+            printf("\n[Warning: Reached maximum context length]\n");
+        }
+    }
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         usage(argv[0]);
@@ -77,6 +179,7 @@ int main(int argc, char **argv) {
     int    num_threads = 4;
     int    json_mode = 0;
     const char *cache_file = NULL;
+    int   chat_mode = 0;
 
     /* Parse arguments */
     for (int i = 2; i < argc; i++) {
@@ -96,6 +199,8 @@ int main(int argc, char **argv) {
             num_threads = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--json") == 0) {
             json_mode = 1;
+        } else if (strcmp(argv[i], "--chat") == 0) {
+            chat_mode = 1;
         } else if (strcmp(argv[i], "--cache") == 0 && i + 1 < argc) {
             cache_file = argv[++i];
         } else {
@@ -170,9 +275,11 @@ int main(int argc, char **argv) {
     if(strstr(model_path, "wen") != NULL) {// crude check for "qwen" in model name to select tokenizer
         tokenizer_encoder = tokenizer_encode_qwen;
         tokenizer_decoder = tokenizer_decode_qwen;
+        model.rope = rope_qwen;
     } else {
         tokenizer_encoder = tokenizer_encode_llama;
         tokenizer_decoder = tokenizer_decode_llama;
+        model.rope = rope_llama;
     }
     int max_prompt_tokens = (int)strlen(prompt) + 3;
     int *prompt_tokens = (int *)malloc((size_t)max_prompt_tokens * sizeof(int));
@@ -188,7 +295,14 @@ int main(int argc, char **argv) {
     fprintf(stderr, "Prompt: %d tokens, generating up to %d (temp=%.2f, top_p=%.2f, threads=%d)\n",
             n_prompt, max_tokens, temperature, top_p, num_threads);
     fprintf(stderr, "---\n");
-
+    if(chat_mode) {
+        run_chat_mode(&model, &tokenizer, &sampler);
+        model_free(&model);
+        tokenizer_free(&tokenizer);
+        grammar_free(&grammar);
+        free(stdin_prompt);
+        return 0;
+    }
     /* Generation loop */
     int total_gen = 0;
     double t_start = get_time_ms();
@@ -261,14 +375,14 @@ int main(int argc, char **argv) {
     if (actual_prefill < 0) actual_prefill = 0;
 
     fprintf(stderr, "---\n");
-    fprintf(stderr, "Prefill: %d tokens in %.2fs (%.1f tok/s)%s\n",
+    fprintf(stderr, "Prefill: %d tokens in %.4fs (%.4f tok/s)%s\n",
             actual_prefill, prefill_time,
             prefill_time > 0 ? (double)actual_prefill / prefill_time : 0,
             start_pos > 0 ? " [partially cached]" : "");
-    fprintf(stderr, "Generation: %d tokens in %.2fs (%.1f tok/s)\n",
+    fprintf(stderr, "Generation: %d tokens in %.4fs (%.4f tok/s)\n",
             total_gen, gen_time,
             gen_time > 0 ? (double)total_gen / gen_time : 0);
-    fprintf(stderr, "Total: %.2fs\n", total_time);
+    fprintf(stderr, "Total: %.4fs\n", total_time);
     fprintf(stderr, "Memory: %.2f MB runtime state (FP16 KV cache)\n",
             (double)model.state.mem_size / (1024.0 * 1024.0));
 

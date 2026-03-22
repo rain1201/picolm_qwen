@@ -116,6 +116,9 @@ typedef struct {
 
 /* ---- Model ---- */
 
+typedef void (*rope_ptr)(float *q, float *k, int head_dim, int n_heads, int n_kv_heads,
+                        const float *cos_pos, const float *sin_pos);
+
 typedef struct {
     model_config_t  config;
     model_weights_t weights;
@@ -138,6 +141,7 @@ typedef struct {
     uint64_t    tok_n_scores;
     uint32_t    tok_bos_id;
     uint32_t    tok_eos_id;
+    rope_ptr    rope;
 } model_t;
 
 /* Load a GGUF model file. Returns 0 on success. */

@@ -481,200 +481,159 @@ static void init_rope_tables(run_state_t *s, const model_config_t *c) {
 }
 
 /* ---- Buffer allocation ---- */
-
 static int allocate_run_state(model_t *m) {
     model_config_t *c = &m->config;
     run_state_t *s = &m->state;
 
     int dim = c->n_embd;
     int n_ffn = c->n_ffn;
+    int q_dim = c->n_heads * c->head_dim;
     int kv_dim = c->n_kv_heads * c->head_dim;
     int half_dim = c->head_dim / 2;
-    int q_dim = c->n_heads * c->head_dim; // 8192
-    int max_scratch = (q_dim > c->n_ffn) ? q_dim : c->n_ffn;
+    int max_scratch = (dim > q_dim) ? dim : q_dim;
 
-    /* Calculate sizes for float buffers */
-    size_t sz_x      = (size_t)c->n_embd * sizeof(float);
+    /* 1. 严格计算每层 Bias 所需的元素量 (必须与后续循环步进完全一致) */
+    /* Qwen 3 中 Q_bias 长度是 q_dim, K/V_bias 是 kv_dim */
+    size_t bias_elements_per_layer = (size_t)q_dim + kv_dim + kv_dim + dim + n_ffn + n_ffn + dim;
+    
+    size_t sz_x      = (size_t)max_scratch * sizeof(float);
     size_t sz_xb     = (size_t)max_scratch * sizeof(float);
     size_t sz_xb2    = (size_t)max_scratch * sizeof(float);
-    //size_t sz_q      = (size_t)c->n_embd * sizeof(float);
-    size_t sz_q = (size_t)c->n_heads * c->head_dim * sizeof(float); 
-    /* att buffer removed (flash attention) */
-    size_t sz_hb     = (size_t)c->n_ffn * sizeof(float);
-    size_t sz_hb2    = (size_t)c->n_ffn * sizeof(float);
+    size_t sz_q      = (size_t)q_dim * sizeof(float);
+    size_t sz_hb     = (size_t)n_ffn * sizeof(float);
+    size_t sz_hb2    = (size_t)n_ffn * sizeof(float);
     size_t sz_logits = (size_t)c->vocab_size * sizeof(float);
-    size_t bias_elements_per_layer = (size_t)dim + kv_dim + kv_dim + dim + n_ffn + n_ffn + dim;
-    size_t sz_all_biases = (size_t)c->n_layers * bias_elements_per_layer * sizeof(float);
-    size_t sz_qk_norm = (size_t)c->n_layers * 2 * c->head_dim * sizeof(float);
-
-
-    int scratch_dim = c->n_embd > c->n_ffn ? c->n_embd : c->n_ffn;
+    
+    int scratch_dim = (dim > n_ffn) ? dim : n_ffn;
     if (c->vocab_size > scratch_dim) scratch_dim = c->vocab_size;
     size_t sz_scratch = (size_t)scratch_dim * sizeof(float);
 
-    /* RoPE tables: cos and sin for each (position, dim_pair) */
     size_t sz_rope = (size_t)c->max_seq_len * half_dim * sizeof(float) * 2;
+    size_t sz_norm = (size_t)(c->n_layers * 2 + 1) * dim * sizeof(float);
+    size_t sz_all_biases = (size_t)c->n_layers * bias_elements_per_layer * sizeof(float);
+    size_t sz_qk_norm = (size_t)c->n_layers * 2 * c->head_dim * sizeof(float);
 
-    /* Norm weights: (n_layers * 2 + 1) * n_embd floats */
-    size_t n_norm = (size_t)(c->n_layers * 2 + 1) * c->n_embd;
-    size_t sz_norm = n_norm * sizeof(float);
-
-    size_t total = sz_x + sz_xb + sz_xb2 + sz_q +
-                   sz_hb + sz_hb2 + sz_logits +
+    /* 总大小 */
+    size_t total = sz_x + sz_xb + sz_xb2 + sz_q + sz_hb + sz_hb2 + sz_logits +
                    sz_scratch + sz_rope + sz_norm + sz_all_biases + sz_qk_norm;
 
-    /* FP16 KV cache: separate allocation */
+    /* KV Cache */
     size_t kv_elements = (size_t)c->n_layers * c->max_seq_len * kv_dim;
-    size_t sz_kv = kv_elements * sizeof(uint16_t) * 2; /* key + val */
+    size_t sz_kv = kv_elements * sizeof(uint16_t) * 2;
 
-    fprintf(stderr, "Allocating %.2f MB for runtime state (+ %.2f MB FP16 KV cache)\n",
-            (double)total / (1024.0 * 1024.0),
-            (double)sz_kv / (1024.0 * 1024.0));
+    fprintf(stderr, "Allocating %.2f MB for runtime state\n", (double)total / (1024.0 * 1024.0));
 
     s->mem_block = calloc(1, total);
-    float *bp = (float *)((uint8_t*)s->mem_block + (total - sz_all_biases));
-    if (!s->mem_block) {
-        fprintf(stderr, "OOM: cannot allocate %zu bytes\n", total);
-        return -1;
-    }
-    s->mem_size = total + sz_kv;
+    if (!s->mem_block) return -1;
+    s->mem_size = total;
 
-    /* Allocate FP16 KV cache separately */
     s->kv_block = calloc(1, sz_kv);
-    if (!s->kv_block) {
-        fprintf(stderr, "OOM: cannot allocate %zu bytes for KV cache\n", sz_kv);
-        free(s->mem_block);
-        return -1;
-    }
+    if (!s->kv_block) { free(s->mem_block); return -1; }
     s->kv_size = sz_kv;
 
-    /* Carve float pointers */
+    /* 2. 顺序切割内存指针 (顺序必须与计算 total 时一致) */
     float *p = (float *)s->mem_block;
-    q_dim = c->n_heads * c->head_dim;
-    s->x      = p; p += c->n_embd;
+    s->x      = p; p += max_scratch;
     s->xb     = p; p += max_scratch;
     s->xb2    = p; p += max_scratch;
     s->q      = p; p += q_dim;
-    s->hb     = p; p += c->n_ffn;
-    s->hb2    = p; p += c->n_ffn;
+    s->hb     = p; p += n_ffn;
+    s->hb2    = p; p += n_ffn;
     s->logits = p; p += c->vocab_size;
     s->dequant_scratch = p; p += scratch_dim;
-
-    /* RoPE tables */
     s->rope_cos = p; p += (size_t)c->max_seq_len * half_dim;
     s->rope_sin = p; p += (size_t)c->max_seq_len * half_dim;
 
-    /* Norm weights */
-    s->norm_weights = p;
-
-    /* FP16 KV cache pointers */
-    uint16_t *kp = (uint16_t *)s->kv_block;
-    s->key_cache = kp; kp += kv_elements;
-    s->val_cache = kp;
-
-    /* Pre-dequantize norm weights */
-    float *nw = s->norm_weights;
+    /* 3. 处理 Norm 权重 */
     for (int l = 0; l < c->n_layers; l++) {
-        s->attn_norm_w[l] = nw;
+        s->attn_norm_w[l] = p;
         if(m->weights.layers[l].type_attn_norm != GGUF_TYPE_NONE) {
-            dequantize_row(m->weights.layers[l].attn_norm, nw, c->n_embd,
-                           m->weights.layers[l].type_attn_norm);
+            dequantize_row(m->weights.layers[l].attn_norm, p, dim, m->weights.layers[l].type_attn_norm);
         }
-        nw += c->n_embd;
-
-        s->ffn_norm_w[l] = nw;
+        p += dim;
+        s->ffn_norm_w[l] = p;
         if(m->weights.layers[l].type_ffn_norm != GGUF_TYPE_NONE) {
-            dequantize_row(m->weights.layers[l].ffn_norm, nw, c->n_embd,
-                           m->weights.layers[l].type_ffn_norm);
+            dequantize_row(m->weights.layers[l].ffn_norm, p, dim, m->weights.layers[l].type_ffn_norm);
         }
-        nw += c->n_embd;
+        p += dim;
     }
-    s->output_norm_w = nw;
+    s->output_norm_w = p;
     if(m->weights.type_output_norm != GGUF_TYPE_NONE) {
-        dequantize_row(m->weights.output_norm, nw, c->n_embd,
-                       m->weights.type_output_norm);
+        dequantize_row(m->weights.output_norm, p, dim, m->weights.type_output_norm);
     }
+    p += dim;
 
-    /* Init tensor scratch */
-    tensor_init_scratch(s->dequant_scratch, scratch_dim);
-    printf("Dequantization scratch buffer: %d floats\n", scratch_dim);
-    /* Pre-compute RoPE tables (eliminates powf/cosf/sinf from hot path) */
-    init_rope_tables(s, c);
+    /* 4. 处理 Bias (使用 bp 指针继续往下切) */
+    float *bp = p; 
     for (int l = 0; l < c->n_layers; l++) {
         layer_weights_t *lw = &m->weights.layers[l];
-
-        // Q Bias
         s->attn_q_bias[l] = bp;
-        if (lw->attn_q_b && lw->type_attn_q_b != GGUF_TYPE_NONE) {
-            dequantize_row(lw->attn_q_b, bp, dim, lw->type_attn_q_b);
-        }
-        bp += dim;
+        if (lw->attn_q_b && lw->type_attn_q_b != GGUF_TYPE_NONE) dequantize_row(lw->attn_q_b, bp, q_dim, lw->type_attn_q_b);
+        bp += q_dim;
 
-        // K Bias
         s->attn_k_bias[l] = bp;
-        if (lw->attn_k_b && lw->type_attn_k_b != GGUF_TYPE_NONE) {
-            dequantize_row(lw->attn_k_b, bp, kv_dim, lw->type_attn_k_b);
-        }
+        if (lw->attn_k_b && lw->type_attn_k_b != GGUF_TYPE_NONE) dequantize_row(lw->attn_k_b, bp, kv_dim, lw->type_attn_k_b);
         bp += kv_dim;
 
-        // V Bias
         s->attn_v_bias[l] = bp;
-        if (lw->attn_v_b && lw->type_attn_v_b != GGUF_TYPE_NONE) {
-            dequantize_row(lw->attn_v_b, bp, kv_dim, lw->type_attn_v_b);
-        }
+        if (lw->attn_v_b && lw->type_attn_v_b != GGUF_TYPE_NONE) dequantize_row(lw->attn_v_b, bp, kv_dim, lw->type_attn_v_b);
         bp += kv_dim;
 
-        // Output Bias
         s->attn_output_bias[l] = bp;
-        if (lw->attn_output_b && lw->type_attn_output_b != GGUF_TYPE_NONE) {
-            dequantize_row(lw->attn_output_b, bp, dim, lw->type_attn_output_b);
-        }
+        if (lw->attn_output_b && lw->type_attn_output_b != GGUF_TYPE_NONE) dequantize_row(lw->attn_output_b, bp, dim, lw->type_attn_output_b);
         bp += dim;
 
-        // FFN Gate Bias
         s->ffn_gate_bias[l] = bp;
-        if (lw->ffn_gate_b && lw->type_ffn_gate_b != GGUF_TYPE_NONE) {
-            dequantize_row(lw->ffn_gate_b, bp, n_ffn, lw->type_ffn_gate_b);
-        }
+        if (lw->ffn_gate_b && lw->type_ffn_gate_b != GGUF_TYPE_NONE) dequantize_row(lw->ffn_gate_b, bp, n_ffn, lw->type_ffn_gate_b);
         bp += n_ffn;
 
-        // FFN Up Bias
         s->ffn_up_bias[l] = bp;
-        if (lw->ffn_up_b && lw->type_ffn_up_b != GGUF_TYPE_NONE) {
-            dequantize_row(lw->ffn_up_b, bp, n_ffn, lw->type_ffn_up_b);
-        }
+        if (lw->ffn_up_b && lw->type_ffn_up_b != GGUF_TYPE_NONE) dequantize_row(lw->ffn_up_b, bp, n_ffn, lw->type_ffn_up_b);
         bp += n_ffn;
 
-        // FFN Down Bias
         s->ffn_down_bias[l] = bp;
-        if (lw->ffn_down_b && lw->type_ffn_down_b != GGUF_TYPE_NONE) {
-            dequantize_row(lw->ffn_down_b, bp, dim, lw->type_ffn_down_b);
-        }
+        if (lw->ffn_down_b && lw->type_ffn_down_b != GGUF_TYPE_NONE) dequantize_row(lw->ffn_down_b, bp, dim, lw->type_ffn_down_b);
         bp += dim;
     }
 
-    p = (float *)((uint8_t*)s->mem_block + (total - sz_qk_norm));
-    //s->qk_norm_buf = p;
-    printf("Q/K norm buffer: %zu floats\n", (size_t)c->n_layers * 2 * c->head_dim);
-    // 5. 循环赋值并执行预反量化 (Pre-Dequantize)
-    float *curr_p = p; // s->qk_norm_buf;
+    /* 5. 处理 QK-Norm 权重 */
+    /*float *curr_p = bp;
     for (int l = 0; l < c->n_layers; l++) {
         layer_weights_t *lw = &m->weights.layers[l];
-
-        // 分配并反量化 Q-norm
         s->attn_q_norm_w[l] = curr_p;
         if (lw->attn_q_norm && lw->type_attn_q_norm != GGUF_TYPE_NONE) {
             dequantize_row(lw->attn_q_norm, curr_p, c->head_dim, lw->type_attn_q_norm);
         }
         curr_p += c->head_dim;
-
-        // 分配并反量化 K-norm
         s->attn_k_norm_w[l] = curr_p;
         if (lw->attn_k_norm && lw->type_attn_k_norm != GGUF_TYPE_NONE) {
             dequantize_row(lw->attn_k_norm, curr_p, c->head_dim, lw->type_attn_k_norm);
         }
         curr_p += c->head_dim;
+    }*/
+
+    float *curr_p = bp;
+    for (int l = 0; l < c->n_layers; l++) {
+        layer_weights_t *lw = &m->weights.layers[l];
+        s->attn_q_norm_w[l] = curr_p;
+        if (lw->attn_q_norm && lw->type_attn_q_norm != GGUF_TYPE_NONE) 
+            dequantize_row(lw->attn_q_norm, curr_p, c->head_dim, lw->type_attn_q_norm);
+        curr_p += c->head_dim; // 128
+
+        s->attn_k_norm_w[l] = curr_p;
+        if (lw->attn_k_norm && lw->type_attn_k_norm != GGUF_TYPE_NONE)
+            dequantize_row(lw->attn_k_norm, curr_p, c->head_dim, lw->type_attn_k_norm);
+        curr_p += c->head_dim; // 128
     }
+
+    /* KV Cache */
+    uint16_t *kp = (uint16_t *)s->kv_block;
+    s->key_cache = kp; kp += kv_elements;
+    s->val_cache = kp;
+
+    tensor_init_scratch(s->dequant_scratch, scratch_dim);
+    init_rope_tables(s, c);
+
     return 0;
 }
 
@@ -749,7 +708,7 @@ float *model_forward(model_t *m, int token, int pos) {
         // --- 新增：QK-Norm 步骤 ---
         // 对 Query 的每个头进行 Norm
 
-        if(lw->attn_q_norm && lw->type_attn_q_norm != GGUF_TYPE_NONE){
+        /*if(lw->attn_q_norm && lw->type_attn_q_norm != GGUF_TYPE_NONE){
             for (int h = 0; h < n_heads; h++) {
                 float* qh = s->q + h * head_dim;
                 rmsnorm(qh, qh, s->attn_q_norm_w[l], head_dim); // 对该头做 Norm
@@ -762,11 +721,26 @@ float *model_forward(model_t *m, int token, int pos) {
                 float* kh = k_tmp + h * head_dim;
                 rmsnorm(kh, kh, s->attn_k_norm_w[l], head_dim);
             }
+        }*/
+        if(lw->attn_q_norm && lw->type_attn_q_norm != GGUF_TYPE_NONE){
+            for (int h = 0; h < n_heads; h++) {
+                float* qh = s->q + h * head_dim;
+                // 注意：32 个 Head 全部使用 s->attn_q_norm_w[l] 这同一个 128 位的权重
+                rmsnorm(qh, qh, s->attn_q_norm_w[l], head_dim); 
+            }
+        }
+
+        if(lw->attn_k_norm && lw->type_attn_k_norm != GGUF_TYPE_NONE){
+            for (int h = 0; h < n_kv_heads; h++) {
+                float* kh = k_tmp + h * head_dim;
+                // 8 个 KV Head 全部使用 s->attn_k_norm_w[l]
+                rmsnorm(kh, kh, s->attn_k_norm_w[l], head_dim);
+            }
         }
 
 
         /* Apply RoPE to Q and K (using pre-computed tables) */
-        rope(s->q, k_tmp, head_dim, n_heads, n_kv_heads, cos_pos, sin_pos);
+        m->rope(s->q, k_tmp, head_dim, n_heads, n_kv_heads, cos_pos, sin_pos);
         
         /* Convert K to FP16 and store */
         for (int d = 0; d < kv_dim; d++) {

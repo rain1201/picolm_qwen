@@ -5,6 +5,7 @@
 
 #define MAX_THREADS 16
 
+
 /* Set the scratch buffer used for row dequantization (embedding lookup, etc).
  * Must be called once at init with a buffer of at least max_row_size floats. */
 void tensor_init_scratch(float *buf, int size);
@@ -30,7 +31,9 @@ void softmax(float *x, int size);
  *   cos_pos[i] = cos(pos / freq_base^(2i/head_dim))
  *   sin_pos[i] = sin(pos / freq_base^(2i/head_dim))
  * Each has head_dim/2 entries. */
-void rope(float *q, float *k, int head_dim, int n_heads, int n_kv_heads,
+void rope_qwen(float *q, float *k, int head_dim, int n_heads, int n_kv_heads,
+          const float *cos_pos, const float *sin_pos);
+void rope_llama(float *q, float *k, int head_dim, int n_heads, int n_kv_heads,
           const float *cos_pos, const float *sin_pos);
 
 /* In-place SiLU: x[i] = x[i] / (1 + exp(-x[i])) */
