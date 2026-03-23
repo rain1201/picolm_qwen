@@ -36,7 +36,8 @@ void usage(const char* prog) {
     std::cerr << "  -s <int>       RNG seed (default: 42)\n";
     std::cerr << "  -c <int>       Context length override\n";
     std::cerr << "  -j <int>       Number of threads (default: 4)\n";
-    std::cerr << "\nOptimization options:\n";
+    std::cerr << "\nMode options:\n";
+    std::cerr << "  --chat         Interactive chat mode with Qwen3 dialogue format\n";
     std::cerr << "  --prefetch     Enable layer prefetching (may improve performance on some systems)\n";
     std::cerr << "\nNote: UTF-8/Chinese input is fully supported.\n";
     std::cerr << "      On Windows, use: chcp 65001 before running for best compatibility.\n";
@@ -73,6 +74,7 @@ int main(int argc, char** argv) {
     int context_override = 0;
     int num_threads = 4;
     bool enable_prefetch = false;
+    bool chat_mode = false;
 
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
@@ -91,6 +93,8 @@ int main(int argc, char** argv) {
             num_threads = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--prefetch") == 0) {
             enable_prefetch = true;
+        } else if (strcmp(argv[i], "--chat") == 0) {
+            chat_mode = true;
         } else {
             std::cerr << "Unknown option: " << argv[i] << "\n";
             usage(argv[0]);
@@ -98,8 +102,8 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (!prompt || !*prompt) {
-        // 尝试从 stdin 读取 prompt
+    /*if (!prompt || !*prompt) {
+        // 尝试从 stdin 读取 prompt (chat mode 不需要 prompt)
         static std::string stdin_prompt;
         char buffer[256];
         while (fgets(buffer, sizeof(buffer), stdin)) {
@@ -108,23 +112,24 @@ int main(int argc, char** argv) {
         if (!stdin_prompt.empty()) {
             // 移除 UTF-8 BOM (如果存在)
             size_t start = 0;
-            if (stdin_prompt.size() >= 3 && 
-                (unsigned char)stdin_prompt[0] == 0xEF && 
-                (unsigned char)stdin_prompt[1] == 0xBB && 
+            if (stdin_prompt.size() >= 3 &&
+                (unsigned char)stdin_prompt[0] == 0xEF &&
+                (unsigned char)stdin_prompt[1] == 0xBB &&
                 (unsigned char)stdin_prompt[2] == 0xBF) {
                 start = 3;
             }
             stdin_prompt = stdin_prompt.substr(start);
-            
+
             // 移除末尾空白字符
             while (!stdin_prompt.empty() && (stdin_prompt.back() == '\n' || stdin_prompt.back() == '\r' || stdin_prompt.back() == ' ')) {
                 stdin_prompt.pop_back();
             }
             prompt = stdin_prompt.c_str();
         }
-    }
+    }*/
 
-    if (!prompt || !*prompt) {
+    // Chat mode doesn't require a prompt
+    if (!chat_mode && (!prompt || !*prompt)) {
         std::cerr << "No prompt provided. Use -p or pipe via stdin.\n";
         usage(argv[0]);
         return 1;
@@ -162,6 +167,107 @@ int main(int argc, char** argv) {
     // Init sampler
     Sampler sampler;
     sampler.init(temperature, top_p, seed);
+
+    // Chat mode: interactive dialogue
+    if (chat_mode) {
+        std::cerr << "\n--- Entering Chat Mode (Qwen3) ---\n";
+        std::cerr << "Type 'exit' to quit, 'clear' to reset context.\n\n";
+        
+        long long input_token_count = 0, input_time_ms = 0, gen_token_count = 0, gen_time_ms = 0;
+        char input_buf[2048];
+        int chat_pos = 0;
+        int max_context = model.config.max_seq_len;
+        const char* system_prompt = "<|im_start|>system\nYou are Qwen, a helpful assistant.<|im_end|>\n";
+        std::vector<int> initial_tokens;
+        int n_system = tokenizer.encode_qwen(system_prompt, initial_tokens, true);
+        input_token_count += n_system;
+        input_time_ms -= get_time_ms();
+        for (int i = 0; i < n_system; i++) {
+            model.forward(initial_tokens[i], chat_pos++);
+        }
+        input_time_ms += get_time_ms();
+
+        while (chat_pos < max_context) {
+            printf("User: ");
+            fflush(stdout);
+
+            if (!fgets(input_buf, sizeof(input_buf), stdin)) break;
+            
+            // Remove trailing newline
+            size_t input_len = strlen(input_buf);
+            while (input_len > 0 && (input_buf[input_len-1] == '\n' || input_buf[input_len-1] == '\r')) {
+                input_buf[--input_len] = 0;
+            }
+            
+            if (strcmp(input_buf, "exit") == 0) break;
+            
+            if (strcmp(input_buf, "clear") == 0) {
+                chat_pos = 0;
+                std::cerr << "\n[Context Cleared]\n\n";
+                continue;
+            }
+            
+            if (input_len == 0) continue;
+            
+            char formatted_input[2560];
+            snprintf(formatted_input, sizeof(formatted_input), "<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n", input_buf);
+
+            // Encode user input
+            std::vector<int> user_tokens;
+            tokenizer.encode_qwen(formatted_input, user_tokens, false);
+            input_token_count += user_tokens.size();
+            input_time_ms -= get_time_ms();
+
+            // Prefill: feed user tokens
+            for (int t : user_tokens) {
+                model.forward(t, chat_pos++);
+                if (chat_pos >= max_context - max_tokens) break;
+            }
+            input_time_ms += get_time_ms();
+            
+            printf("Assistant: ");
+            fflush(stdout);
+            
+            int gen_tokens = 0;
+            int token = user_tokens.empty() ? 0 : user_tokens.back();
+
+            gen_time_ms -= get_time_ms();
+            while (chat_pos < max_context && gen_tokens < max_tokens) {
+                float* logits = model.forward(token, chat_pos++);
+                int next = sampler.sample(logits, model.config.vocab_size);
+                
+                if (next == (int)tokenizer.eos_id || next == 151645) {
+                    printf("\n");
+                    break;
+                }
+                
+                const char* piece = tokenizer.decode_qwen(next);
+                fwrite(piece, 1, strlen(piece), stdout);
+                fflush(stdout);
+                
+                token = next;
+                gen_tokens++;
+            }
+            gen_token_count += gen_tokens;
+            gen_time_ms += get_time_ms();
+            
+            if (chat_pos >= max_context - max_tokens) {
+                printf("\n[Warning: Context full]\n");
+                break;
+            }
+        }
+
+        std::cerr << "---\n";
+        std::cerr << "Input: " << input_token_count << " tokens in " << (input_time_ms / 1000.0)
+                << "s (" << (input_time_ms > 0 ? input_token_count / (input_time_ms / 1000.0) : 0) << " tok/s)\n";
+        std::cerr << "Generation: " << gen_token_count << " tokens in " << (gen_time_ms / 1000.0)
+                << "s (" << (gen_time_ms > 0 ? gen_token_count / (gen_time_ms / 1000.0) : 0) << " tok/s)\n";
+        std::cerr << "Total: " << (input_time_ms + gen_time_ms) / 1000.0 << "s\n";
+        std::cerr << "Memory: " << (model.state.mem_size / (1024.0 * 1024.0)) << " MB runtime state\n";
+
+        TensorOps::cleanup_thread_pool();
+        return 0;
+    }
 
     // Encode prompt
     std::vector<int> prompt_tokens;
