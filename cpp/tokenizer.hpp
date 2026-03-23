@@ -16,6 +16,118 @@ struct Tokenizer {
     uint32_t eos_id = 2;
     int vocab_size = 0;
 
+    // Byte-level BPE: Unicode code point to byte mapping (GPT-2/Qwen style)
+    // This reverses the byte_to_unicode mapping used in tokenizer training
+    static int unicode_to_byte(int cp) {
+        // GPT-2 byte-to-unicode mapping:
+        // - Printable ASCII (33-126) stay as is
+        // - Latin-1 supplement (161-172, 174-255) stay as is  
+        // - Other bytes (0-32, 127-160, 173) are shifted to 256+
+        
+        // Direct mappings (these code points represent themselves)
+        if ((cp >= 33 && cp <= 126) || (cp >= 161 && cp <= 172) || (cp >= 174 && cp <= 255)) {
+            return cp;
+        }
+        
+        // Shifted mappings: code points 256+ represent bytes that were shifted
+        // We need to find which byte maps to this code point
+        int n = 0;
+        for (int b = 0; b < 256; b++) {
+            bool skip = false;
+            if (b >= 33 && b <= 126) skip = true;
+            if (b >= 161 && b <= 172) skip = true;
+            if (b >= 174 && b <= 255) skip = true;
+            
+            if (!skip) {
+                if (cp == 256 + n) return b;
+                n++;
+            }
+        }
+        
+        // Fallback
+        return cp & 0xFF;
+    }
+
+    // Recover raw bytes from vocab string (reverse of byte_to_unicode encoding)
+    // This converts the "mangled" UTF-8 back to original byte sequence
+    static std::string recover_raw_bytes(const std::string& s) {
+        std::string res;
+        res.reserve(s.size());
+        
+        for (size_t i = 0; i < s.size(); ) {
+            unsigned char c = (unsigned char)s[i];
+            uint32_t cp = 0;
+            int len = 0;
+            
+            // UTF-8 decode to get Unicode code point
+            if (c < 0x80) {
+                // Single byte (ASCII)
+                cp = c;
+                len = 1;
+            } else if ((c & 0xE0) == 0xC0) {
+                // 2-byte UTF-8
+                if (i + 1 >= s.size()) { i++; continue; }
+                cp = c & 0x1F;
+                len = 2;
+            } else if ((c & 0xF0) == 0xE0) {
+                // 3-byte UTF-8
+                if (i + 2 >= s.size()) { i++; continue; }
+                cp = c & 0x0F;
+                len = 3;
+            } else if ((c & 0xF8) == 0xF0) {
+                // 4-byte UTF-8
+                if (i + 3 >= s.size()) { i++; continue; }
+                cp = c & 0x07;
+                len = 4;
+            } else {
+                // Invalid UTF-8 lead byte, treat as raw byte
+                res += (char)c;
+                i++;
+                continue;
+            }
+            
+            // Complete UTF-8 decode
+            for (int j = 1; j < len && i + j < s.size(); j++) {
+                cp = (cp << 6) | ((unsigned char)s[i + j] & 0x3F);
+            }
+            i += len;
+            
+            // Map Unicode code point back to original byte
+            res += (char)unicode_to_byte((int)cp);
+        }
+        
+        return res;
+    }
+    
+    // Encode UTF-8 string to double-encoded form (for matching against fixed vocab)
+    static std::string to_double_utf8(const std::string& s) {
+        std::string result;
+        result.reserve(s.size() * 2);
+        
+        for (size_t i = 0; i < s.size(); i++) {
+            unsigned char c = (unsigned char)s[i];
+            if (c < 0x80) {
+                // ASCII stays as is
+                result += (char)c;
+            } else {
+                // High byte gets UTF-8 encoded as if it were Latin-1
+                // 0x80-0xFF -> U+0080-U+00FF -> UTF-8: C2 80-C3 BF
+                unsigned char c1 = 0xC0 | (c >> 6);
+                unsigned char c2 = 0x80 | (c & 0x3F);
+                // Fix: 0x80-0xBF should use C2, 0xC0-0xFF should use C3
+                if (c < 0xC0) {
+                    c1 = 0xC2;
+                } else {
+                    c1 = 0xC3;
+                }
+                result += (char)c1;
+                result += (char)c2;
+            }
+        }
+        
+        return result;
+    }
+
     int load(const void* tokens_data, uint64_t n_tokens,
              const void* scores_data, uint64_t n_scores,
              uint32_t bos, uint32_t eos, int vs) {
@@ -35,7 +147,9 @@ struct Tokenizer {
                 std::memcpy(&slen, p, 8);
                 p += 8;
                 if (slen > 0) {
-                    vocab[i].assign((const char*)p, (size_t)slen);
+                    std::string raw((const char*)p, (size_t)slen);
+                    // Recover raw bytes from byte-level BPE encoded vocab string
+                    vocab[i] = recover_raw_bytes(raw);
                 }
                 p += slen;
             }
@@ -53,7 +167,7 @@ struct Tokenizer {
         std::sort(sorted_idx.begin(), sorted_idx.end(), [this](int a, int b) {
             return vocab[a] < vocab[b];
         });
-
+        
         return 0;
     }
 
@@ -84,63 +198,46 @@ struct Tokenizer {
         if (!text || !*text) return (int)tokens.size();
 
         int text_len = (int)strlen(text);
-        
-        // Step 1: Convert text to initial token sequence (char by char)
+
+        // Step 1: Greedy longest match tokenization
         std::vector<int> merge_buf;
-        merge_buf.reserve((size_t)text_len * 3 + 1);
+        merge_buf.reserve((size_t)text_len + 1);
 
-        for (int i = 0; i < text_len; ) {
-            int clen = 1;
-            unsigned char c = (unsigned char)text[i];
-            if (c >= 0xF0) clen = 4;
-            else if (c >= 0xE0) clen = 3;
-            else if (c >= 0xC0) clen = 2;
-            if (i + clen > text_len) clen = text_len - i;
+        int i = 0;
+        while (i < text_len) {
+            // Try to find the longest matching token starting at position i
+            int best_len = 0;
+            int best_tok = -1;
 
-            int tok = vocab_lookup(text + i, clen);
-            if (tok >= 0) {
-                merge_buf.push_back(tok);
-                i += clen;
+            // Try lengths from 1 up to remaining text (or max token length)
+            int max_try = text_len - i;
+            if (max_try > 64) max_try = 64;  // Limit max token length to check
+
+            for (int try_len = max_try; try_len >= 1; --try_len) {
+                int tok = vocab_lookup(text + i, try_len);
+                if (tok >= 0) {
+                    best_len = try_len;
+                    best_tok = tok;
+                    break;  // Found longest match
+                }
+            }
+
+            if (best_tok >= 0) {
+                merge_buf.push_back(best_tok);
+                i += best_len;
             } else {
-                // Fall back to byte token
+                // Fall back to byte token for unknown characters
                 char byte_tok[8];
                 snprintf(byte_tok, sizeof(byte_tok), "<0x%02X>", (unsigned char)text[i]);
-                tok = vocab_lookup(byte_tok, (int)strlen(byte_tok));
-                if (tok >= 0) merge_buf.push_back(tok);
+                int tok = vocab_lookup(byte_tok, (int)strlen(byte_tok));
+                if (tok >= 0) {
+                    merge_buf.push_back(tok);
+                }
                 i++;
             }
         }
 
-        // Step 2: BPE merge loop
-        while ((int)merge_buf.size() >= 2) {
-            float best_score = -1e30f;
-            int best_idx = -1;
-            int best_tok = -1;
-
-            for (int i = 0; i < (int)merge_buf.size() - 1; i++) {
-                const std::string& s1 = vocab[merge_buf[i]];
-                const std::string& s2 = vocab[merge_buf[i + 1]];
-                
-                // Check if concatenation fits
-                if (s1.size() + s2.size() > 256) continue;
-                
-                std::string merged = s1 + s2;
-                int tok = vocab_lookup(merged.c_str(), (int)merged.size());
-                if (tok >= 0 && scores[tok] > best_score) {
-                    best_score = scores[tok];
-                    best_idx = i;
-                    best_tok = tok;
-                }
-            }
-
-            if (best_idx < 0) break;
-            
-            // Apply merge
-            merge_buf[best_idx] = best_tok;
-            merge_buf.erase(merge_buf.begin() + best_idx + 1);
-        }
-
-        // Copy to output
+        // Copy to output (no BPE merge needed since we already did longest match)
         for (int tok : merge_buf) {
             tokens.push_back(tok);
         }
@@ -151,14 +248,14 @@ struct Tokenizer {
     const char* decode_qwen(int token) const {
         if (token < 0 || token >= vocab_size) return "";
         const std::string& str = vocab[token];
-        
+
         static thread_local std::string clean_buf;
         clean_buf.clear();
 
         for (size_t i = 0; i < str.size(); i++) {
             unsigned char c = (unsigned char)str[i];
-            
-            // 1. 处理字节级 BPE 转义符 <0xXX>
+
+            // 处理字节级 BPE 转义符 <0xXX>
             if (c == '<' && i + 5 < str.size() && str[i+1] == '0' && str[i+2] == 'x') {
                 unsigned int val = 0;
                 if (sscanf(str.c_str() + i, "<0x%02X>", &val) == 1) {
@@ -167,17 +264,10 @@ struct Tokenizer {
                     continue;
                 }
             }
-            
-            // 2. 处理 Qwen 特有的字节映射 (Ġ -> 空格，Ċ -> 换行)
-            // 'Ġ' (U+0100 = C4 A0 in UTF-8) -> space
-            // 'Ċ' (U+010A = C4 8A in UTF-8) -> newline
-            if (c == 0xC4 && i + 1 < str.size()) {
-                unsigned char next_c = (unsigned char)str[i+1];
-                if (next_c == 0xA0) { clean_buf += ' '; i++; continue; }
-                if (next_c == 0x8A) { clean_buf += '\n'; i++; continue; }
-            }
 
-            // 3. 直接透传原始 UTF-8 字节 (支持中文等多字节字符)
+            // 直接透传原始字节
+            // vocab 已经通过 recover_raw_bytes 还原为原始字节序列
+            // 这些字节就是正确的 UTF-8 编码（中文等多字节字符会正确组合）
             clean_buf += str[i];
         }
         return clean_buf.c_str();
