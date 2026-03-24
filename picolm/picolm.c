@@ -192,6 +192,17 @@ int main(int argc, char **argv) {
         total_steps = model.config.max_seq_len;
     }
 
+    float* logits = model_forward_batch(&model, prompt_tokens, n_prompt, 0); /* prefill all prompt tokens in batch */
+    grammar_apply(&grammar, logits, model.config.vocab_size);
+    int next = sampler_sample(&sampler, logits, model.config.vocab_size);
+    grammar_advance(&grammar, &tokenizer, next);
+    const char* piece = tokenizer_decode(&tokenizer, token, next);
+    printf("%s", piece);
+    fflush(stdout);
+    pos = n_prompt;
+    token = next;
+    total_gen++;
+    
     for (; pos < total_steps; pos++) {
         /* Determine which token to feed */
         if (pos < start_pos) {

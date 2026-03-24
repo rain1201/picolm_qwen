@@ -130,6 +130,10 @@ int model_load(model_t *m, const char *path, int max_seq_len);
 /* Run one forward pass. Returns pointer to logits[vocab_size]. */
 float *model_forward(model_t *m, int token, int pos);
 
+/* Run a forward pass for a batch of tokens. The batch should contain a contiguous sequence of tokens starting at start_pos.
+ * Returns pointer to logits for the last token in the batch (i.e. batch_x[(num_tokens-1) * dim] after the final RMSNorm). */
+float *model_forward_batch(model_t *m, const int *tokens, int num_tokens, int start_pos);
+
 /* Free all resources. */
 void model_free(model_t *m);
 
