@@ -37,6 +37,7 @@ struct ModelConfig {
     int alignment = 32;
     GGUFType weight_type = GGUFType::F16;
     bool use_prefetch = false;
+    bool use_evict = false;
 };
 
 struct LayerWeights {
@@ -132,15 +133,69 @@ struct Model {
 
     ~Model() { free(); }
 
-    int load(const char* path, int max_seq_len_override = 0, bool prefetch = false) {
+    int load(const char* path, int max_seq_len_override = 0, bool prefetch = false, bool evict = false) {
         weights = ModelWeights();  // Zero-initialize
         config.use_prefetch = prefetch;
+        config.use_evict = evict;
 
         if (mmap_file(path) != 0) return -1;
         if (parse_gguf(max_seq_len_override) != 0) return -1;
         if (allocate_run_state() != 0) return -1;
 
         return 0;
+    }
+
+    void prefetch(int l) {
+        int dim = config.n_embd;
+        int n_ffn = config.n_ffn;
+        int head_dim = config.head_dim;
+        int n_heads = config.n_heads;
+        int q_dim = n_heads * head_dim;
+
+
+        // 预取下一层
+        if (config.use_prefetch && l + 1 < config.n_layers) {
+            LayerWeights* next_lw = &weights.layers[l + 1];
+            size_t attn_size = (size_t)gguf_type_row_size(next_lw->type_attn_q, dim) * q_dim;
+            size_t ffn_size = (size_t)gguf_type_row_size(next_lw->type_ffn_gate, dim) * n_ffn;
+            MemoryPrefetcher::prefetch_layer(next_lw->attn_q, attn_size);
+            MemoryPrefetcher::prefetch_layer(next_lw->attn_k, attn_size);
+            MemoryPrefetcher::prefetch_layer(next_lw->attn_v, attn_size);
+            MemoryPrefetcher::prefetch_layer(next_lw->attn_output, attn_size);
+            MemoryPrefetcher::prefetch_layer(next_lw->ffn_gate, ffn_size);
+            MemoryPrefetcher::prefetch_layer(next_lw->ffn_up, ffn_size);
+            MemoryPrefetcher::prefetch_layer(next_lw->ffn_down, ffn_size);
+        }
+    }
+
+    void evict(int l){
+        LayerWeights* lw = &weights.layers[l];
+        int dim = config.n_embd;
+        int n_ffn = config.n_ffn;
+        int head_dim = config.head_dim;
+        int n_heads = config.n_heads;
+        int q_dim = n_heads * head_dim;
+        int kv_dim = config.n_kv_heads * head_dim;
+
+        // 定义操作系统级内存驱逐 Helper (用后即弃)
+        auto evict_tensor =[](const void* ptr, size_t size) {
+            if (!ptr || size == 0) return;
+#ifdef _WIN32
+            VirtualUnlock((LPVOID)ptr, size);
+#else
+            madvise((void*)ptr, size, MADV_DONTNEED);
+#endif
+        };
+
+        if (config.use_evict) {
+                evict_tensor(lw->attn_q,      gguf_type_row_size(lw->type_attn_q, dim) * q_dim);
+                evict_tensor(lw->attn_k,      gguf_type_row_size(lw->type_attn_k, dim) * kv_dim);
+                evict_tensor(lw->attn_v,      gguf_type_row_size(lw->type_attn_v, dim) * kv_dim);
+                evict_tensor(lw->attn_output, gguf_type_row_size(lw->type_attn_output, q_dim) * dim);
+                evict_tensor(lw->ffn_gate,    gguf_type_row_size(lw->type_ffn_gate, dim) * n_ffn);
+                evict_tensor(lw->ffn_up,      gguf_type_row_size(lw->type_ffn_up, dim) * n_ffn);
+                evict_tensor(lw->ffn_down,    gguf_type_row_size(lw->type_ffn_down, n_ffn) * dim);
+        }
     }
 
     float* forward(int token, int pos) {
@@ -168,20 +223,7 @@ struct Model {
         for (int l = 0; l < config.n_layers; l++) {
             LayerWeights* lw = &weights.layers[l];
             
-            // 预取下一层的数据 (使用操作系统 API 实现计算与 I/O 重叠)
-            if (config.use_prefetch && l + 1 < config.n_layers) {
-                LayerWeights* next_lw = &weights.layers[l + 1];
-                // 估算每层权重的大小 (量化后约 2-4 bits per weight)
-                size_t attn_size = (size_t)dim * (size_t)q_dim / 4;
-                size_t ffn_size = (size_t)dim * (size_t)n_ffn / 4;
-                MemoryPrefetcher::prefetch_layer(next_lw->attn_q, attn_size);
-                MemoryPrefetcher::prefetch_layer(next_lw->attn_k, attn_size);
-                MemoryPrefetcher::prefetch_layer(next_lw->attn_v, attn_size);
-                MemoryPrefetcher::prefetch_layer(next_lw->attn_output, attn_size);
-                MemoryPrefetcher::prefetch_layer(next_lw->ffn_gate, ffn_size);
-                MemoryPrefetcher::prefetch_layer(next_lw->ffn_up, ffn_size);
-                MemoryPrefetcher::prefetch_layer(next_lw->ffn_down, ffn_size);
-            }
+            prefetch(l);
 
             // Attention
             TensorOps::rmsnorm(state.xb.data(), state.x.data(), state.attn_norm_w[l].data(), dim);
@@ -302,6 +344,169 @@ struct Model {
         }
 
         // Final norm and output
+        TensorOps::rmsnorm(state.xb.data(), state.x.data(), state.output_norm_w.data(), dim);
+        TensorOps::matmul(state.logits.data(), state.xb.data(), weights.output, 
+                         dim, config.vocab_size, weights.type_output);
+
+        return state.logits.data();
+    }
+
+    // ------------------- 新增：Layer-wise 批处理前向传播 (用于 Prefill 阶段) -------------------
+    float* forward_batch(const std::vector<int>& tokens, int start_pos) {
+        int num_tokens = (int)tokens.size();
+        if (num_tokens == 0) return nullptr;
+
+        int dim = config.n_embd;
+        int n_ffn = config.n_ffn;
+        int n_heads = config.n_heads;
+        int n_kv_heads = config.n_kv_heads;
+        int head_dim = config.head_dim;
+        int kv_dim = n_kv_heads * head_dim;
+        int kv_mul = n_heads / n_kv_heads;
+        int half_dim = head_dim / 2;
+        int q_dim = n_heads * head_dim;
+
+        // 为这一批 token 分配跨层的中间状态 Buffer
+        // 大小为 num_tokens * dim，通常只有几十MB，完全可以放进内存
+        std::vector<float> batch_x((size_t)num_tokens * dim, 0.0f);
+
+        // 1. 一次性完成所有 Token 的 Embedding Lookup
+        for (int i = 0; i < num_tokens; i++) {
+            size_t row_bytes = gguf_type_row_size(weights.type_token_embd, dim);
+            const void* embd_row = (const uint8_t*)weights.token_embd + (size_t)tokens[i] * row_bytes;
+            dequantize_row(embd_row, batch_x.data() + (size_t)i * dim, dim, weights.type_token_embd);
+        }
+
+
+        // 2. Transformer 层循环 (外层为 Layer，内层为 Token)
+        for (int l = 0; l < config.n_layers; l++) {
+            LayerWeights* lw = &weights.layers[l];
+
+            prefetch(l);
+
+            // 对该层依次处理所有 Token
+            for (int i = 0; i < num_tokens; i++) {
+                int pos = start_pos + i;
+                
+                // 将当前 Token 的状态载入 state.x 以复用后续的单 Token 运算逻辑
+                std::memcpy(state.x.data(), batch_x.data() + (size_t)i * dim, dim * sizeof(float));
+
+                // ---------- Attention ----------
+                TensorOps::rmsnorm(state.xb.data(), state.x.data(), state.attn_norm_w[l].data(), dim);
+                
+                // Q, K, V 计算...
+                TensorOps::matmul_bias(state.q.data(), state.xb.data(), lw->attn_q, 
+                                       state.attn_q_bias[l].data(), dim, q_dim, 
+                                       lw->type_attn_q, lw->type_attn_q_b, state.dequant_scratch.data());
+                
+                if (lw->attn_q_norm && state.attn_q_norm_w[l].data()) {
+                    for (int h = 0; h < n_heads; h++) {
+                        float* qh = state.q.data() + h * head_dim;
+                        TensorOps::rmsnorm(qh, qh, state.attn_q_norm_w[l].data(), head_dim);
+                    }
+                }
+                
+                TensorOps::matmul_bias(state.xb2.data(), state.xb.data(), lw->attn_k,
+                                       state.attn_k_bias[l].data(), dim, kv_dim,
+                                       lw->type_attn_k, lw->type_attn_k_b, state.dequant_scratch.data());
+                
+                if (lw->attn_k_norm && state.attn_k_norm_w[l].data()) {
+                    for (int h = 0; h < n_kv_heads; h++) {
+                        float* kh = state.xb2.data() + h * head_dim;
+                        TensorOps::rmsnorm(kh, kh, state.attn_k_norm_w[l].data(), head_dim);
+                    }
+                }
+
+                // RoPE
+                const float* cos_pos = state.rope_cos.data() + (size_t)pos * half_dim;
+                const float* sin_pos = state.rope_sin.data() + (size_t)pos * half_dim;
+                rope_fn(state.q.data(), state.xb2.data(), head_dim, n_heads, n_kv_heads, cos_pos, sin_pos);
+
+                // 将 K 存入 KV Cache
+                uint16_t* kcache_layer = state.key_cache.data() + (size_t)l * config.max_seq_len * kv_dim;
+                uint16_t* key_pos_fp16 = kcache_layer + (size_t)pos * kv_dim;
+                for (int d = 0; d < kv_dim; d++) {
+                    key_pos_fp16[d] = fp32_to_fp16(state.xb2.data()[d]);
+                }
+
+                TensorOps::matmul_bias(state.xb2.data(), state.xb.data(), lw->attn_v,
+                                       state.attn_v_bias[l].data(), dim, kv_dim,
+                                       lw->type_attn_v, lw->type_attn_v_b, state.dequant_scratch.data());
+                
+                // 将 V 存入 KV Cache
+                uint16_t* vcache_layer = state.val_cache.data() + (size_t)l * config.max_seq_len * kv_dim;
+                uint16_t* val_pos_fp16 = vcache_layer + (size_t)pos * kv_dim;
+                for (int d = 0; d < kv_dim; d++) {
+                    val_pos_fp16[d] = fp32_to_fp16(state.xb2.data()[d]);
+                }
+
+                // Flash Attention
+                std::fill(state.xb.data(), state.xb.data() + q_dim, 0.0f);
+                for (int h = 0; h < n_heads; h++) {
+                    float* qh = state.q.data() + h * head_dim;
+                    int kv_h = h / kv_mul;
+                    float* xbh = state.xb.data() + h * head_dim;
+
+                    float max_score = -1e30f;
+                    float sum_exp = 0.0f;
+                    std::fill(state.acc, state.acc + head_dim, 0.0f);
+
+                    for (int t = 0; t <= pos; t++) {
+                        const uint16_t* kt = kcache_layer + (size_t)t * kv_dim + kv_h * head_dim;
+                        const uint16_t* vt = vcache_layer + (size_t)t * kv_dim + kv_h * head_dim;
+
+                        float score = 0.0f;
+                        for (int d = 0; d < head_dim; d++) {
+                            score += qh[d] * fp16_to_fp32(kt[d]);
+                        }
+                        score /= std::sqrt((float)head_dim);
+
+                        if (score > max_score) {
+                            float correction = std::exp(max_score - score);
+                            sum_exp *= correction;
+                            for (int d = 0; d < head_dim; d++) state.acc[d] *= correction;
+                            sum_exp += 1.0f;
+                            for (int d = 0; d < head_dim; d++) state.acc[d] += fp16_to_fp32(vt[d]);
+                            max_score = score;
+                        } else {
+                            float w = std::exp(score - max_score);
+                            sum_exp += w;
+                            for (int d = 0; d < head_dim; d++) state.acc[d] += w * fp16_to_fp32(vt[d]);
+                        }
+                    }
+                    for (int d = 0; d < head_dim; d++) {
+                        xbh[d] = state.acc[d] / sum_exp;
+                    }
+                }
+
+                // 输出映射
+                TensorOps::matmul_bias(state.xb2.data(), state.xb.data(), lw->attn_output,
+                                       state.attn_output_bias[l].data(), q_dim, dim,
+                                       lw->type_attn_output, lw->type_attn_output_b, state.dequant_scratch.data());
+                TensorOps::vec_add(state.x.data(), state.xb2.data(), dim);
+
+                // ---------- FFN ----------
+                TensorOps::rmsnorm(state.xb.data(), state.x.data(), state.ffn_norm_w[l].data(), dim);
+                TensorOps::matmul_bias(state.hb.data(), state.xb.data(), lw->ffn_gate,
+                                       state.ffn_gate_bias[l].data(), dim, n_ffn,
+                                       lw->type_ffn_gate, lw->type_ffn_gate_b, state.dequant_scratch.data());
+                TensorOps::silu(state.hb.data(), n_ffn);
+                TensorOps::matmul(state.hb2.data(), state.xb.data(), lw->ffn_up, dim, n_ffn, lw->type_ffn_up);
+                TensorOps::elemwise_mul(state.hb.data(), state.hb.data(), state.hb2.data(), n_ffn);
+                TensorOps::matmul_bias(state.xb.data(), state.hb.data(), lw->ffn_down,
+                                       state.ffn_down_bias[l].data(), n_ffn, dim,
+                                       lw->type_ffn_down, lw->type_ffn_down_b, state.dequant_scratch.data());
+                TensorOps::vec_add(state.x.data(), state.xb.data(), dim);
+
+                // 算完了，把状态写回 batch_x
+                std::memcpy(batch_x.data() + (size_t)i * dim, state.x.data(), dim * sizeof(float));
+            } // end of token loop
+
+            evict(l);
+        } // end of layer loop
+
+        // 3. Final norm and output (只计算最后一个 Token 的 Logits 即可)
+        std::memcpy(state.x.data(), batch_x.data() + (size_t)(num_tokens - 1) * dim, dim * sizeof(float));
         TensorOps::rmsnorm(state.xb.data(), state.x.data(), state.output_norm_w.data(), dim);
         TensorOps::matmul(state.logits.data(), state.xb.data(), weights.output, 
                          dim, config.vocab_size, weights.type_output);

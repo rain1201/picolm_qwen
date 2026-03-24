@@ -74,6 +74,7 @@ int main(int argc, char** argv) {
     int context_override = 0;
     int num_threads = 4;
     bool enable_prefetch = false;
+    bool enable_evict = false;
     bool chat_mode = false;
 
     for (int i = 2; i < argc; i++) {
@@ -93,6 +94,8 @@ int main(int argc, char** argv) {
             num_threads = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--prefetch") == 0) {
             enable_prefetch = true;
+        } else if (strcmp(argv[i], "--evict") == 0) {
+            enable_evict = true;
         } else if (strcmp(argv[i], "--chat") == 0) {
             chat_mode = true;
         } else {
@@ -138,7 +141,7 @@ int main(int argc, char** argv) {
     // Load model
     std::cerr << "Loading model: " << model_path << "\n";
     Model model;
-    if (model.load(model_path, context_override, enable_prefetch) != 0) {
+    if (model.load(model_path, context_override, enable_prefetch, enable_evict) != 0) {
         std::cerr << "Failed to load model\n";
         return 1;
     }
@@ -182,8 +185,9 @@ int main(int argc, char** argv) {
         int n_system = tokenizer.encode_qwen(system_prompt, initial_tokens, true);
         input_token_count += n_system;
         input_time_ms -= get_time_ms();
-        for (int i = 0; i < n_system; i++) {
-            model.forward(initial_tokens[i], chat_pos++);
+        if (!initial_tokens.empty()) {
+            model.forward_batch(initial_tokens, chat_pos);
+            chat_pos += initial_tokens.size();
         }
         input_time_ms += get_time_ms();
 
@@ -219,9 +223,9 @@ int main(int argc, char** argv) {
             input_time_ms -= get_time_ms();
 
             // Prefill: feed user tokens
-            for (int t : user_tokens) {
-                model.forward(t, chat_pos++);
-                if (chat_pos >= max_context - max_tokens) break;
+            if (!user_tokens.empty()) {
+                model.forward_batch(user_tokens, chat_pos);
+                chat_pos += user_tokens.size();
             }
             input_time_ms += get_time_ms();
             
@@ -287,6 +291,19 @@ int main(int argc, char** argv) {
     int token = prompt_tokens[0];
     int pos = 0;
     int total_steps = std::min(n_prompt + max_tokens, model.config.max_seq_len);
+
+    float* logits = model.forward_batch(prompt_tokens, 0);
+    t_first_token = get_time_ms();
+
+    int next = sampler.sample(logits, model.config.vocab_size);
+    const char* piece = tokenizer.decode_qwen(next);
+    fwrite(piece, 1, strlen(piece), stdout);
+    fflush(stdout);
+
+    token = next;
+    total_gen = 1;
+    pos = n_prompt; 
+    total_steps = std::min(n_prompt + max_tokens, model.config.max_seq_len);
 
     for (; pos < total_steps; pos++) {
         float* logits = model.forward(token, pos);
