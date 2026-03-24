@@ -99,6 +99,7 @@ struct RunState {
     std::vector<std::vector<float>> ffn_gate_bias, ffn_up_bias, ffn_down_bias;
     std::vector<float> output_norm_w;
     std::vector<std::vector<float>> attn_q_norm_w, attn_k_norm_w;
+    float acc[512];
     
     size_t mem_size = 0;
 };
@@ -243,7 +244,8 @@ struct Model {
 
                 float max_score = -1e30f;
                 float sum_exp = 0.0f;
-                std::vector<float> acc(head_dim, 0.0f);
+                //std::vector<float> acc(head_dim, 0.0f);
+                std::fill(state.acc, state.acc + head_dim, 0.0f);
 
                 for (int t = 0; t <= pos; t++) {
                     const uint16_t* kt = kcache_layer + (size_t)t * kv_dim + kv_h * head_dim;
@@ -258,23 +260,23 @@ struct Model {
                     if (score > max_score) {
                         float correction = std::exp(max_score - score);
                         sum_exp *= correction;
-                        for (int d = 0; d < head_dim; d++) acc[d] *= correction;
+                        for (int d = 0; d < head_dim; d++) state.acc[d] *= correction;
                         sum_exp += 1.0f;
                         for (int d = 0; d < head_dim; d++) {
-                            acc[d] += fp16_to_fp32(vt[d]);
+                            state.acc[d] += fp16_to_fp32(vt[d]);
                         }
                         max_score = score;
                     } else {
                         float w = std::exp(score - max_score);
                         sum_exp += w;
                         for (int d = 0; d < head_dim; d++) {
-                            acc[d] += w * fp16_to_fp32(vt[d]);
+                            state.acc[d] += w * fp16_to_fp32(vt[d]);
                         }
                     }
                 }
 
                 for (int d = 0; d < head_dim; d++) {
-                    xbh[d] = acc[d] / sum_exp;
+                    xbh[d] = state.acc[d] / sum_exp;
                 }
             }
 
@@ -581,16 +583,16 @@ private:
         int half_dim = config.head_dim / 2;
         int max_scratch = std::max({dim, q_dim, n_ffn, config.vocab_size});
 
-        state.x.resize((size_t)max_scratch);
-        state.xb.resize((size_t)max_scratch);
-        state.xb2.resize((size_t)max_scratch);
-        state.q.resize((size_t)q_dim);
-        state.hb.resize((size_t)n_ffn);
-        state.hb2.resize((size_t)n_ffn);
-        state.logits.resize((size_t)config.vocab_size);
-        state.dequant_scratch.resize((size_t)max_scratch);
-        state.rope_cos.resize((size_t)config.max_seq_len * half_dim);
-        state.rope_sin.resize((size_t)config.max_seq_len * half_dim);
+        state.x.resize((size_t)max_scratch, 0.0f);
+        state.xb.resize((size_t)max_scratch, 0.0f);
+        state.xb2.resize((size_t)max_scratch, 0.0f);
+        state.q.resize((size_t)q_dim, 0.0f);
+        state.hb.resize((size_t)n_ffn, 0.0f);
+        state.hb2.resize((size_t)n_ffn, 0.0f);
+        state.logits.resize((size_t)config.vocab_size, 0.0f);
+        state.dequant_scratch.resize((size_t)max_scratch, 0.0f);
+        state.rope_cos.resize((size_t)config.max_seq_len * half_dim, 0.0f);
+        state.rope_sin.resize((size_t)config.max_seq_len * half_dim, 0.0f);
 
         // Norm weights - use flat arrays for efficiency
         state.attn_norm_w.resize((size_t)config.n_layers);
@@ -621,13 +623,13 @@ private:
         state.ffn_down_bias.resize((size_t)config.n_layers);
 
         for (int l = 0; l < config.n_layers; l++) {
-            state.attn_q_bias[l].resize((size_t)q_dim);
-            state.attn_k_bias[l].resize((size_t)kv_dim);
-            state.attn_v_bias[l].resize((size_t)kv_dim);
-            state.attn_output_bias[l].resize((size_t)dim);
-            state.ffn_gate_bias[l].resize((size_t)n_ffn);
-            state.ffn_up_bias[l].resize((size_t)n_ffn);
-            state.ffn_down_bias[l].resize((size_t)dim);
+            state.attn_q_bias[l].resize((size_t)q_dim, 0.0f);
+            state.attn_k_bias[l].resize((size_t)kv_dim, 0.0f);
+            state.attn_v_bias[l].resize((size_t)kv_dim, 0.0f);
+            state.attn_output_bias[l].resize((size_t)dim, 0.0f);
+            state.ffn_gate_bias[l].resize((size_t)n_ffn, 0.0f);
+            state.ffn_up_bias[l].resize((size_t)n_ffn, 0.0f);
+            state.ffn_down_bias[l].resize((size_t)dim, 0.0f);
 
             LayerWeights* lw = &weights.layers[l];
             if (lw->attn_q_b && lw->type_attn_q_b != GGUFType::NONE)
@@ -662,8 +664,8 @@ private:
 
         // KV Cache - use config.max_seq_len for proper indexing
         size_t kv_elements = (size_t)config.n_layers * (size_t)config.max_seq_len * (size_t)kv_dim;
-        state.key_cache.resize(kv_elements);
-        state.val_cache.resize(kv_elements);
+        state.key_cache.resize(kv_elements, 0);
+        state.val_cache.resize(kv_elements, 0);
 
         // RoPE tables
         for (int pos = 0; pos < config.max_seq_len; pos++) {
