@@ -41,6 +41,10 @@ struct ModelConfig {
     int ssm_state_size = 128;
     int ssm_inner_size = 4096;
     int ssm_time_step_rank = 32;
+    int ssm_qkv_dim = 6144;
+    int ssm_head_dim = 128;
+    int ssm_n_heads = 16;
+    int ssm_n_kv_heads = 16;
     int full_attention_interval = 4;
 
     bool use_prefetch = false;
@@ -78,6 +82,10 @@ struct LayerWeights {
     const void* attn_qkv = nullptr;       // 融合的 QKV 投影 或 SSM 的 in_proj
     const void* attn_gate = nullptr;      // 门控
     const void* post_attention_norm = nullptr; // 取代原有的 ffn_norm
+
+    int ssm_conv1d_len = 0; // 【新增】记录 1D 卷积权重的元素个数
+    int attn_q_norm_len = 0; // 【新增】记录 Q-Norm 的真实维度长度
+    int attn_k_norm_len = 0; // 【新增】记录 K-Norm 的真实维度长度
 
     GGUFType type_attn_norm = GGUFType::NONE;
     GGUFType type_attn_q = GGUFType::NONE;
@@ -135,9 +143,10 @@ struct RunState {
     float acc[512];
 
     std::vector<std::vector<float>> post_attn_norm_w, ssm_norm_w;
+    std::vector<std::vector<float>> ssm_conv1d_w; // 【新增】用来存放反量化后的 1D 卷积权重
     std::vector<float> ssm_conv_state;   // [ssm_layer][(kernel_size-1)*qkv_dim]
     std::vector<float> ssm_hidden_state; //[ssm_layer][n_heads*head_dim*head_dim]
-    
+
     size_t mem_size = 0;
 };
 
@@ -273,22 +282,28 @@ struct Model {
                 
                 // QK-Norm for Q (before RoPE)
                 if (lw->attn_q_norm && state.attn_q_norm_w[l].data()) {
+                    int q_norm_len = lw->attn_q_norm_len > 0 ? lw->attn_q_norm_len : n_heads * head_dim;
+                    int norm_per_head = q_norm_len / n_heads;
                     for (int h = 0; h < n_heads; h++) {
                         float* qh = state.q.data() + h * head_dim;
-                        TensorOps::rmsnorm(qh, qh, state.attn_q_norm_w[l].data(), head_dim);
+                        const float* norm_w_h = state.attn_q_norm_w[l].data() + h * norm_per_head;
+                        TensorOps::rmsnorm(qh, qh, norm_w_h, head_dim);
                     }
                 }
-                
+
                 // K projection (use xb2 as temp buffer)
                 TensorOps::matmul_bias(state.xb2.data(), state.xb.data(), lw->attn_k,
                                     state.attn_k_bias[l].data(), dim, kv_dim,
                                     lw->type_attn_k, lw->type_attn_k_b, state.dequant_scratch.data());
-                
+
                 // QK-Norm for K (before RoPE)
                 if (lw->attn_k_norm && state.attn_k_norm_w[l].data()) {
+                    int k_norm_len = lw->attn_k_norm_len > 0 ? lw->attn_k_norm_len : n_kv_heads * head_dim;
+                    int norm_per_head = k_norm_len / n_kv_heads;
                     for (int h = 0; h < n_kv_heads; h++) {
                         float* kh = state.xb2.data() + h * head_dim;
-                        TensorOps::rmsnorm(kh, kh, state.attn_k_norm_w[l].data(), head_dim);
+                        const float* norm_w_h = state.attn_k_norm_w[l].data() + h * norm_per_head;
+                        TensorOps::rmsnorm(kh, kh, norm_w_h, head_dim);
                     }
                 }
 
@@ -381,46 +396,40 @@ struct Model {
                 TensorOps::vec_add(state.x.data(), state.xb.data(), dim);
                 break;}
                 case (layer_type::SSM):{
-                    // 1. SSM (Gated DeltaNet) 替代注意力块
-                    TensorOps::rmsnorm(state.xb.data(), state.x.data(), state.attn_norm_w[l].data(), dim);
+                     TensorOps::rmsnorm(state.xb.data(), state.x.data(), state.attn_norm_w[l].data(), dim);
 
-                    int qkv_dim = config.n_heads * config.head_dim + 2 * config.n_kv_heads * config.head_dim;
-                    float* curr_conv_state = state.ssm_conv_state.data() + l * (config.ssm_conv_kernel - 1) * qkv_dim;
-                    float* curr_hidden_state = state.ssm_hidden_state.data() + l * config.n_heads * config.head_dim * config.head_dim;
+                    // 修复点：强制与 Transformer 维度隔离，Qwen 混合架构的 SSM head 恒定为 128
+                    int ssm_qkv_dim = config.ssm_qkv_dim; // SSM 的 QKV 投影维度
+                    int ssm_head_dim = config.ssm_head_dim; // SSM 的 head_dim 固定为 128
+                    int ssm_n_heads = config.ssm_n_heads; // SSM 的 head 数量
+                    int ssm_n_kv_heads = config.ssm_n_kv_heads;
+
+                    float* curr_conv_state = state.ssm_conv_state.data() + l * (config.ssm_conv_kernel - 1) * ssm_qkv_dim;
+                    float* curr_hidden_state = state.ssm_hidden_state.data() + l * ssm_n_heads * ssm_head_dim * ssm_head_dim;
                     
                     SSMOps::forward_ssm_step(
-                        state.xb2.data(),      
-                        state.xb.data(),       
-                        lw,                    
-                        dim,
-                        qkv_dim,
-                        config.n_heads,
-                        config.n_kv_heads,
-                        config.head_dim,
-                        config.ssm_conv_kernel,
-                        curr_conv_state,
-                        curr_hidden_state,
-                        state.ssm_norm_w[l].data(),
-                        state.dequant_scratch.data() 
+                        state.xb2.data(), state.xb.data(), lw,
+                        dim, ssm_qkv_dim, ssm_n_heads, ssm_n_kv_heads, ssm_head_dim, config.ssm_conv_kernel,
+                        curr_conv_state, curr_hidden_state,
+                        (weights.layers[l].ssm_norm && weights.layers[l].type_ssm_norm != GGUFType::NONE) ? state.ssm_norm_w[l].data() : nullptr,
+                        (weights.layers[l].ssm_conv1d && weights.layers[l].type_ssm_conv1d != GGUFType::NONE) ? state.ssm_conv1d_w[l].data() : nullptr,
+                        weights.layers[l].ssm_conv1d_len,
+                        state.dequant_scratch.data()
                     );
 
-                    // 残差连接
                     TensorOps::vec_add(state.x.data(), state.xb2.data(), dim);
 
-                    // 2. 补充被遗漏的 Post Attention Norm 
+                    // --- Post Attention 和 FFN 块 ---
                     TensorOps::rmsnorm(state.xb.data(), state.x.data(), state.post_attn_norm_w[l].data(), dim);
-
-                    // 3. 补充被遗漏的常规 FFN 层！
                     TensorOps::matmul_bias(state.hb.data(), state.xb.data(), lw->ffn_gate,
-                                        state.ffn_gate_bias[l].data(), dim, n_ffn,
-                                        lw->type_ffn_gate, lw->type_ffn_gate_b, state.dequant_scratch.data());
+                                           state.ffn_gate_bias[l].data(), dim, n_ffn,
+                                           lw->type_ffn_gate, lw->type_ffn_gate_b, state.dequant_scratch.data());
                     TensorOps::silu(state.hb.data(), n_ffn);
                     TensorOps::matmul(state.hb2.data(), state.xb.data(), lw->ffn_up, dim, n_ffn, lw->type_ffn_up);
                     TensorOps::elemwise_mul(state.hb.data(), state.hb.data(), state.hb2.data(), n_ffn);
                     TensorOps::matmul_bias(state.xb.data(), state.hb.data(), lw->ffn_down,
-                                        state.ffn_down_bias[l].data(), n_ffn, dim,
-                                        lw->type_ffn_down, lw->type_ffn_down_b, state.dequant_scratch.data());
-                    // FFN 残差连接
+                                           state.ffn_down_bias[l].data(), n_ffn, dim,
+                                           lw->type_ffn_down, lw->type_ffn_down_b, state.dequant_scratch.data());
                     TensorOps::vec_add(state.x.data(), state.xb.data(), dim);
                     break;}
                 default:
@@ -835,14 +844,27 @@ private:
                     else if (suffix == "ffn_gate.bias") { lw->ffn_gate_b = ptr; lw->type_ffn_gate_b = qtype; }
                     else if (suffix == "ffn_down.bias") { lw->ffn_down_b = ptr; lw->type_ffn_down_b = qtype; }
                     else if (suffix == "ffn_up.bias") { lw->ffn_up_b = ptr; lw->type_ffn_up_b = qtype; }
-                    else if (suffix == "attn_q_norm.weight") { lw->attn_q_norm = ptr; lw->type_attn_q_norm = qtype; }
-                    else if (suffix == "attn_k_norm.weight") { lw->attn_k_norm = ptr; lw->type_attn_k_norm = qtype; }
-                    
+                    else if (suffix == "attn_q_norm.weight") { 
+                        lw->attn_q_norm = ptr; 
+                        lw->type_attn_q_norm = qtype;
+                        lw->attn_q_norm_len = ti.dims[0]; // 记录真实长度
+                    }
+                    else if (suffix == "attn_k_norm.weight") { 
+                        lw->attn_k_norm = ptr; 
+                        lw->type_attn_k_norm = qtype;
+                        lw->attn_k_norm_len = ti.dims[0]; // 记录真实长度
+                    }
+
                     else if (suffix == "ssm_norm.weight") {lw->type=layer_type::SSM; lw->ssm_norm = ptr; lw->type_ssm_norm = qtype;}
                     else if (suffix == "ssm_a") { lw->ssm_a = ptr; lw->type_ssm_a = qtype;}
                     else if (suffix == "ssm_alpha.weight") { lw->ssm_alpha= ptr; lw->type_ssm_alpha = qtype;}
                     else if (suffix == "ssm_beta.weight") { lw->ssm_beta = ptr; lw->type_ssm_beta = qtype;}
-                    else if (suffix == "ssm_conv1d.weight") { lw->ssm_conv1d = ptr; lw->type_ssm_conv1d = qtype;}
+                    else if (suffix == "ssm_conv1d.weight") { 
+                        lw->ssm_conv1d = ptr; 
+                        lw->type_ssm_conv1d = qtype;
+                        // 【新增】保存权重总元素个数
+                        lw->ssm_conv1d_len = (ti.n_dims >= 2) ? (ti.dims[0] * ti.dims[1]) : ti.dims[0];
+                    }
                     else if (suffix == "ssm_dt.bias") { lw->ssm_dt_bias = ptr; lw->type_ssm_dt_bias = qtype;}
                     else if (suffix == "ssm_out.weight") { lw->ssm_out = ptr; lw->type_ssm_out = qtype;}
 
@@ -890,7 +912,11 @@ private:
         int kv_dim = config.n_kv_heads * config.head_dim;
         int half_dim = config.head_dim / 2;
         int ssm_inner = config.ssm_inner_size;
-        int max_scratch = std::max({dim, 2 * q_dim, n_ffn, config.vocab_size, ssm_inner * 6}); 
+        int ssm_qkv_dim = config.ssm_qkv_dim;
+        int ssm_n_heads = config.ssm_n_heads;
+        int ssm_head_dim = config.ssm_head_dim;
+
+        int max_scratch = std::max({dim, 2 * q_dim, n_ffn, config.vocab_size, ssm_inner * 6, ssm_qkv_dim * 2 + ssm_n_heads * 2 + dim * 2}); 
 
         state.x.resize((size_t)max_scratch, 0.0f);
         state.xb.resize((size_t)max_scratch, 0.0f);
@@ -961,38 +987,52 @@ private:
         state.attn_q_norm_w.resize((size_t)config.n_layers);
         state.attn_k_norm_w.resize((size_t)config.n_layers);
         for (int l = 0; l < config.n_layers; l++) {
-            state.attn_q_norm_w[l].resize((size_t)config.head_dim);
-            state.attn_k_norm_w[l].resize((size_t)config.head_dim);
+            int q_norm_len = weights.layers[l].attn_q_norm_len > 0 ? weights.layers[l].attn_q_norm_len : config.n_heads * config.head_dim;
+            int k_norm_len = weights.layers[l].attn_k_norm_len > 0 ? weights.layers[l].attn_k_norm_len : config.n_kv_heads * config.head_dim;
+
+            state.attn_q_norm_w[l].resize((size_t)q_norm_len, 0.0f);
+            state.attn_k_norm_w[l].resize((size_t)k_norm_len, 0.0f);
+
             if (weights.layers[l].attn_q_norm && weights.layers[l].type_attn_q_norm != GGUFType::NONE) {
-                dequantize_row(weights.layers[l].attn_q_norm, state.attn_q_norm_w[l].data(), config.head_dim, weights.layers[l].type_attn_q_norm);
+                dequantize_row(weights.layers[l].attn_q_norm, state.attn_q_norm_w[l].data(), q_norm_len, weights.layers[l].type_attn_q_norm);
             }
             if (weights.layers[l].attn_k_norm && weights.layers[l].type_attn_k_norm != GGUFType::NONE) {
-                dequantize_row(weights.layers[l].attn_k_norm, state.attn_k_norm_w[l].data(), config.head_dim, weights.layers[l].type_attn_k_norm);
+                dequantize_row(weights.layers[l].attn_k_norm, state.attn_k_norm_w[l].data(), k_norm_len, weights.layers[l].type_attn_k_norm);
             }
         }
+
+        //int ssm_head_dim = 128; // Qwen 混合架构的 SSM head 维度永远是 128
+        int ssm_norm_size = ssm_n_heads * ssm_head_dim; // 【修复】2048
 
         state.attn_norm_w.resize((size_t)config.n_layers);
         state.ffn_norm_w.resize((size_t)config.n_layers);
         state.post_attn_norm_w.resize((size_t)config.n_layers);
         state.ssm_norm_w.resize((size_t)config.n_layers);
+        state.ssm_conv1d_w.resize((size_t)config.n_layers); // 【新增】
         state.output_norm_w.resize((size_t)dim);
 
         for (int l = 0; l < config.n_layers; l++) {
             state.attn_norm_w[l].resize((size_t)dim);
             state.ffn_norm_w[l].resize((size_t)dim);
             state.post_attn_norm_w[l].resize((size_t)dim, 0.0f);
-            state.ssm_norm_w[l].resize((size_t)config.head_dim, 0.0f);
+            state.ssm_norm_w[l].resize((size_t)ssm_norm_size, 0.0f); // 【修复】使用 ssm_norm_size
 
             if (weights.layers[l].type_attn_norm != GGUFType::NONE)
                 dequantize_row(weights.layers[l].attn_norm, state.attn_norm_w[l].data(), dim, weights.layers[l].type_attn_norm);
             if (weights.layers[l].type_ffn_norm != GGUFType::NONE)
                 dequantize_row(weights.layers[l].ffn_norm, state.ffn_norm_w[l].data(), dim, weights.layers[l].type_ffn_norm);
-            
-            // 新增加载
             if (weights.layers[l].post_attention_norm && weights.layers[l].type_post_attention_norm != GGUFType::NONE)
                 dequantize_row(weights.layers[l].post_attention_norm, state.post_attn_norm_w[l].data(), dim, weights.layers[l].type_post_attention_norm);
             if (weights.layers[l].ssm_norm && weights.layers[l].type_ssm_norm != GGUFType::NONE)
-                dequantize_row(weights.layers[l].ssm_norm, state.ssm_norm_w[l].data(), config.head_dim, weights.layers[l].type_ssm_norm);
+                dequantize_row(weights.layers[l].ssm_norm, state.ssm_norm_w[l].data(), ssm_norm_size, weights.layers[l].type_ssm_norm);
+            
+            // 【新增】正确反量化 ssm_conv1d 权重，避免 F16 强转 F32 出现 NaN
+            int conv_len = weights.layers[l].ssm_conv1d_len;
+            if (conv_len == 0) conv_len = config.ssm_qkv_dim * config.ssm_conv_kernel; // 兼容缺省
+            state.ssm_conv1d_w[l].resize((size_t)conv_len, 0.0f);
+            if (weights.layers[l].ssm_conv1d && weights.layers[l].type_ssm_conv1d != GGUFType::NONE) {
+                dequantize_row(weights.layers[l].ssm_conv1d, state.ssm_conv1d_w[l].data(), conv_len, weights.layers[l].type_ssm_conv1d);
+            }
         }
 
         // KV Cache - use config.max_seq_len for proper indexing
@@ -1001,12 +1041,13 @@ private:
         state.key_cache.resize(kv_elements, 0);
         state.val_cache.resize(kv_elements, 0);
 
-        int num_ssm_layers = config.n_layers;// - num_attn_layers;
-        // 1D 卷积缓存: 每一层需要保存前 (kernel_size - 1) 个 token 的隐状态
-        state.ssm_conv_state.resize(num_ssm_layers * (config.ssm_conv_kernel - 1) * config.ssm_inner_size, 0.0f);
-        // SSM 循环隐状态: h_t 矩阵
-        state.ssm_hidden_state.resize(num_ssm_layers * config.ssm_inner_size * config.ssm_state_size, 0.0f);
-        
+        //int ssm_qkv_dim = dim * 2; // QKV 投影必定是 dim 的 2 倍
+        int num_ssm_layers = config.n_layers;
+
+        state.ssm_conv_state.resize(num_ssm_layers * (config.ssm_conv_kernel - 1) * ssm_qkv_dim, 0.0f);
+        // 隐状态大小：ssm_n_heads * head_dim * head_dim
+        state.ssm_hidden_state.resize(num_ssm_layers * ssm_n_heads * ssm_head_dim * ssm_head_dim, 0.0f);
+
         // RoPE tables
         for (int pos = 0; pos < config.max_seq_len; pos++) {
             float* cos_row = state.rope_cos.data() + (size_t)pos * half_dim;
@@ -1022,7 +1063,18 @@ private:
                         state.rope_cos.capacity() * sizeof(float) * 2 +
                         kv_elements * sizeof(uint16_t) * 2 +
                         state.ssm_conv_state.capacity() * sizeof(float) +
-                        state.ssm_hidden_state.capacity() * sizeof(float);
+                        state.ssm_hidden_state.capacity() * sizeof(float) + 
+                        state.attn_norm_w.capacity() * sizeof(float) * dim * 2 +
+                        state.ffn_norm_w.capacity() * sizeof(float) * dim * 2 +
+                        state.post_attn_norm_w.capacity() * sizeof(float) * dim +
+                        state.ssm_norm_w.capacity() * sizeof(float) * ssm_head_dim +
+                        state.attn_q_bias.capacity() * sizeof(float) * q_dim +
+                        state.attn_k_bias.capacity() * sizeof(float) * kv_dim +
+                        state.attn_v_bias.capacity() * sizeof(float) * kv_dim +
+                        state.attn_output_bias.capacity() * sizeof(float) * dim +
+                        state.ffn_gate_bias.capacity() * sizeof(float) * n_ffn +
+                        state.ffn_up_bias.capacity() * sizeof(float) * n_ffn +
+                        state.ffn_down_bias.capacity() * sizeof(float) * dim ;
 
         fprintf(stderr, "Allocating %.2f MB for runtime state\n", state.mem_size / (1024.0 * 1024.0));
         return 0;
