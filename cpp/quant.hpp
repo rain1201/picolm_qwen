@@ -30,6 +30,11 @@ enum class GGUFType : uint32_t {
     Q6_K   = 15,
 };
 
+enum class layer_type {
+    TRANSFORMER = 0,
+    SSM = 1,
+};
+
 #pragma pack(push, 1)
 struct block_q4_K {
     uint16_t d;
@@ -55,6 +60,14 @@ struct block_q2_K {
 struct block_q8_0 {
     uint16_t d;
     int8_t   qs[32];
+};
+
+struct block_q5_K {
+    uint8_t  scales[12];
+    uint8_t  qh[32];
+    uint8_t  qs[128];
+    uint16_t d;
+    uint16_t dmin;
 };
 
 struct block_q6_K {
@@ -250,6 +263,43 @@ inline void dequantize_row_q4_K(const void* src, float* dst, int n) {
     }
 }
 
+inline void dequantize_row_q5_K(const void* src, float* dst, int n) {
+    const block_q5_K* blocks = (const block_q5_K*)src;
+    int nb = n / 256;
+    for (int i = 0; i < nb; i++) {
+        const block_q5_K* b = &blocks[i];
+        float d = fp16_to_fp32(b->d);
+        float dmin = fp16_to_fp32(b->dmin);
+
+        int is = 0;
+        const uint8_t* ql = b->qs;
+        const uint8_t* qh = b->qh;
+        float* y = dst + i * 256;
+
+        for (int j = 0; j < 8; j++) {
+            uint8_t sc, mn;
+            get_scale_min_k4(is, b->scales, &sc, &mn);
+            float d1 = d * (float)sc;
+            float m1 = dmin * (float)mn;
+
+            int l0 = j * 32;
+            for (int l = 0; l < 32; l++) {
+                // 提取低 4 位
+                uint8_t q_l = (j < 4) ? (ql[l] & 0xF) : (ql[l] >> 4);
+                // 从 qh 提取第 5 位
+                uint8_t q_h = (qh[l] >> j) & 1;
+                // 拼接为 5-bit
+                uint8_t q_val = q_l | (q_h << 4);
+                y[l0 + l] = d1 * (float)q_val - m1;
+            }
+            if (j == 3) {
+                ql += 32; // 前四个块(128个元素)处理完后，移动到下半部分
+            }
+            is++;
+        }
+    }
+}
+
 inline void dequantize_row_q6_K(const void* src, float* dst, int n) {
     const block_q6_K* blocks = (const block_q6_K*)src;
     int nb = n / 256;
@@ -287,8 +337,10 @@ inline void dequantize_row(const void* src, float* dst, int n, GGUFType type) {
         case GGUFType::Q4_0: dequantize_row_q4_0(src, dst, n); break;
         case GGUFType::Q8_0: dequantize_row_q8_0(src, dst, n); break;
         case GGUFType::Q4_K: dequantize_row_q4_K(src, dst, n); break;
+        case GGUFType::Q5_K: dequantize_row_q5_K(src, dst, n); break;
         case GGUFType::Q6_K: dequantize_row_q6_K(src, dst, n); break;
         default:
+            fprintf(stderr, "\n[Fatal Error] Unsupported quantization type: %d\n", (int)type);
             throw std::runtime_error("Unsupported quantization type");
     }
 }

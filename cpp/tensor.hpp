@@ -10,6 +10,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <functional>
+#include "model.hpp"
 
 class TensorOps {
 private:
@@ -419,7 +420,6 @@ public:
 #endif
     }
 };
-
 // Static member definitions
 int TensorOps::n_threads = 1;
 TensorOps::ThreadPool* TensorOps::pool = nullptr;

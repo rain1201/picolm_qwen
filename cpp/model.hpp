@@ -36,6 +36,13 @@ struct ModelConfig {
     float rope_freq_base = 10000.0f;
     int alignment = 32;
     GGUFType weight_type = GGUFType::F16;
+
+    int ssm_conv_kernel = 4;
+    int ssm_state_size = 128;
+    int ssm_inner_size = 4096;
+    int ssm_time_step_rank = 32;
+    int full_attention_interval = 4;
+
     bool use_prefetch = false;
     bool use_evict = false;
 };
@@ -59,6 +66,19 @@ struct LayerWeights {
     const void* ffn_gate = nullptr;
     const void* ffn_down = nullptr;
     const void* ffn_up = nullptr;
+
+    const void* ssm_a = nullptr;          // blk.0.ssm_a
+    const void* ssm_dt_bias = nullptr;    // blk.0.ssm_dt.bias
+    const void* ssm_conv1d = nullptr;     // blk.0.ssm_conv1d.weight
+    const void* ssm_alpha = nullptr;      // blk.0.ssm_alpha.weight (或 x_proj / dt_proj)
+    const void* ssm_beta = nullptr;       // blk.0.ssm_beta.weight
+    const void* ssm_norm = nullptr;       // blk.0.ssm_norm.weight
+    const void* ssm_out = nullptr;        // blk.0.ssm_out.weight
+
+    const void* attn_qkv = nullptr;       // 融合的 QKV 投影 或 SSM 的 in_proj
+    const void* attn_gate = nullptr;      // 门控
+    const void* post_attention_norm = nullptr; // 取代原有的 ffn_norm
+
     GGUFType type_attn_norm = GGUFType::NONE;
     GGUFType type_attn_q = GGUFType::NONE;
     GGUFType type_attn_k = GGUFType::NONE;
@@ -77,6 +97,18 @@ struct LayerWeights {
     GGUFType type_ffn_up_b = GGUFType::NONE;
     GGUFType type_attn_q_norm = GGUFType::NONE;
     GGUFType type_attn_k_norm = GGUFType::NONE;
+    GGUFType type_ssm_a = GGUFType::NONE;
+    GGUFType type_ssm_dt_bias = GGUFType::NONE;
+    GGUFType type_ssm_conv1d = GGUFType::NONE;
+    GGUFType type_ssm_alpha = GGUFType::NONE;
+    GGUFType type_ssm_beta = GGUFType::NONE;
+    GGUFType type_ssm_norm = GGUFType::NONE;
+    GGUFType type_ssm_out = GGUFType::NONE;
+    GGUFType type_attn_qkv = GGUFType::NONE;
+    GGUFType type_attn_gate = GGUFType::NONE;
+    GGUFType type_post_attention_norm = GGUFType::NONE;
+
+    layer_type type = layer_type::TRANSFORMER;
 };
 
 struct ModelWeights {
@@ -101,12 +133,16 @@ struct RunState {
     std::vector<float> output_norm_w;
     std::vector<std::vector<float>> attn_q_norm_w, attn_k_norm_w;
     float acc[512];
+
+    std::vector<std::vector<float>> post_attn_norm_w, ssm_norm_w;
+    std::vector<float> ssm_conv_state;   // [ssm_layer][(kernel_size-1)*qkv_dim]
+    std::vector<float> ssm_hidden_state; //[ssm_layer][n_heads*head_dim*head_dim]
     
     size_t mem_size = 0;
 };
 
 using RopeFn = void(*)(float*, float*, int, int, int, const float*, const float*);
-
+#include "ssm.hpp"
 struct Model {
     ModelConfig config;
     ModelWeights weights;
@@ -212,6 +248,8 @@ struct Model {
         const float* cos_pos = state.rope_cos.data() + (size_t)pos * half_dim;
         const float* sin_pos = state.rope_sin.data() + (size_t)pos * half_dim;
 
+        int ssm_layer_idx = 0;
+
         // 1. Embedding lookup
         {
             size_t row_bytes = gguf_type_row_size(weights.type_token_embd, dim);
@@ -222,125 +260,172 @@ struct Model {
         // 2. Transformer layers
         for (int l = 0; l < config.n_layers; l++) {
             LayerWeights* lw = &weights.layers[l];
-            
             prefetch(l);
+            switch (lw->type) {
+                case (layer_type::TRANSFORMER):{
+                    // Attention
+                TensorOps::rmsnorm(state.xb.data(), state.x.data(), state.attn_norm_w[l].data(), dim);
+                
+                // Q projection
+                TensorOps::matmul_bias(state.q.data(), state.xb.data(), lw->attn_q, 
+                                    state.attn_q_bias[l].data(), dim, q_dim, 
+                                    lw->type_attn_q, lw->type_attn_q_b, state.dequant_scratch.data());
+                
+                // QK-Norm for Q (before RoPE)
+                if (lw->attn_q_norm && state.attn_q_norm_w[l].data()) {
+                    for (int h = 0; h < n_heads; h++) {
+                        float* qh = state.q.data() + h * head_dim;
+                        TensorOps::rmsnorm(qh, qh, state.attn_q_norm_w[l].data(), head_dim);
+                    }
+                }
+                
+                // K projection (use xb2 as temp buffer)
+                TensorOps::matmul_bias(state.xb2.data(), state.xb.data(), lw->attn_k,
+                                    state.attn_k_bias[l].data(), dim, kv_dim,
+                                    lw->type_attn_k, lw->type_attn_k_b, state.dequant_scratch.data());
+                
+                // QK-Norm for K (before RoPE)
+                if (lw->attn_k_norm && state.attn_k_norm_w[l].data()) {
+                    for (int h = 0; h < n_kv_heads; h++) {
+                        float* kh = state.xb2.data() + h * head_dim;
+                        TensorOps::rmsnorm(kh, kh, state.attn_k_norm_w[l].data(), head_dim);
+                    }
+                }
 
-            // Attention
-            TensorOps::rmsnorm(state.xb.data(), state.x.data(), state.attn_norm_w[l].data(), dim);
-            
-            // Q projection
-            TensorOps::matmul_bias(state.q.data(), state.xb.data(), lw->attn_q, 
-                                   state.attn_q_bias[l].data(), dim, q_dim, 
-                                   lw->type_attn_q, lw->type_attn_q_b, state.dequant_scratch.data());
-            
-            // QK-Norm for Q (before RoPE)
-            if (lw->attn_q_norm && state.attn_q_norm_w[l].data()) {
+                // RoPE for Q and K
+                rope_fn(state.q.data(), state.xb2.data(), head_dim, n_heads, n_kv_heads, cos_pos, sin_pos);
+
+                // Store K as FP16
+                uint16_t* kcache_layer = state.key_cache.data() + (size_t)l * config.max_seq_len * kv_dim;
+                uint16_t* key_pos_fp16 = kcache_layer + (size_t)pos * kv_dim;
+                for (int d = 0; d < kv_dim; d++) {
+                    key_pos_fp16[d] = fp32_to_fp16(state.xb2.data()[d]);
+                }
+
+                // V projection (reuse xb2 buffer after K is stored)
+                TensorOps::matmul_bias(state.xb2.data(), state.xb.data(), lw->attn_v,
+                                    state.attn_v_bias[l].data(), dim, kv_dim,
+                                    lw->type_attn_v, lw->type_attn_v_b, state.dequant_scratch.data());
+                
+                // Store V as FP16
+                uint16_t* vcache_layer = state.val_cache.data() + (size_t)l * config.max_seq_len * kv_dim;
+                uint16_t* val_pos_fp16 = vcache_layer + (size_t)pos * kv_dim;
+                for (int d = 0; d < kv_dim; d++) {
+                    val_pos_fp16[d] = fp32_to_fp16(state.xb2.data()[d]);
+                }
+
+                // Flash Attention (online softmax)
+                std::fill(state.xb.data(), state.xb.data() + q_dim, 0.0f);
+                
                 for (int h = 0; h < n_heads; h++) {
                     float* qh = state.q.data() + h * head_dim;
-                    TensorOps::rmsnorm(qh, qh, state.attn_q_norm_w[l].data(), head_dim);
-                }
-            }
-            
-            // K projection (use xb2 as temp buffer)
-            TensorOps::matmul_bias(state.xb2.data(), state.xb.data(), lw->attn_k,
-                                   state.attn_k_bias[l].data(), dim, kv_dim,
-                                   lw->type_attn_k, lw->type_attn_k_b, state.dequant_scratch.data());
-            
-            // QK-Norm for K (before RoPE)
-            if (lw->attn_k_norm && state.attn_k_norm_w[l].data()) {
-                for (int h = 0; h < n_kv_heads; h++) {
-                    float* kh = state.xb2.data() + h * head_dim;
-                    TensorOps::rmsnorm(kh, kh, state.attn_k_norm_w[l].data(), head_dim);
-                }
-            }
+                    int kv_h = h / kv_mul;
+                    float* xbh = state.xb.data() + h * head_dim;
 
-            // RoPE for Q and K
-            rope_fn(state.q.data(), state.xb2.data(), head_dim, n_heads, n_kv_heads, cos_pos, sin_pos);
+                    float max_score = -1e30f;
+                    float sum_exp = 0.0f;
+                    //std::vector<float> acc(head_dim, 0.0f);
+                    std::fill(state.acc, state.acc + head_dim, 0.0f);
 
-            // Store K as FP16
-            uint16_t* kcache_layer = state.key_cache.data() + (size_t)l * config.max_seq_len * kv_dim;
-            uint16_t* key_pos_fp16 = kcache_layer + (size_t)pos * kv_dim;
-            for (int d = 0; d < kv_dim; d++) {
-                key_pos_fp16[d] = fp32_to_fp16(state.xb2.data()[d]);
-            }
+                    for (int t = 0; t <= pos; t++) {
+                        const uint16_t* kt = kcache_layer + (size_t)t * kv_dim + kv_h * head_dim;
+                        const uint16_t* vt = vcache_layer + (size_t)t * kv_dim + kv_h * head_dim;
 
-            // V projection (reuse xb2 buffer after K is stored)
-            TensorOps::matmul_bias(state.xb2.data(), state.xb.data(), lw->attn_v,
-                                   state.attn_v_bias[l].data(), dim, kv_dim,
-                                   lw->type_attn_v, lw->type_attn_v_b, state.dequant_scratch.data());
-            
-            // Store V as FP16
-            uint16_t* vcache_layer = state.val_cache.data() + (size_t)l * config.max_seq_len * kv_dim;
-            uint16_t* val_pos_fp16 = vcache_layer + (size_t)pos * kv_dim;
-            for (int d = 0; d < kv_dim; d++) {
-                val_pos_fp16[d] = fp32_to_fp16(state.xb2.data()[d]);
-            }
+                        float score = 0.0f;
+                        for (int d = 0; d < head_dim; d++) {
+                            score += qh[d] * fp16_to_fp32(kt[d]);
+                        }
+                        score /= std::sqrt((float)head_dim);
 
-            // Flash Attention (online softmax)
-            std::fill(state.xb.data(), state.xb.data() + q_dim, 0.0f);
-            
-            for (int h = 0; h < n_heads; h++) {
-                float* qh = state.q.data() + h * head_dim;
-                int kv_h = h / kv_mul;
-                float* xbh = state.xb.data() + h * head_dim;
+                        if (score > max_score) {
+                            float correction = std::exp(max_score - score);
+                            sum_exp *= correction;
+                            for (int d = 0; d < head_dim; d++) state.acc[d] *= correction;
+                            sum_exp += 1.0f;
+                            for (int d = 0; d < head_dim; d++) {
+                                state.acc[d] += fp16_to_fp32(vt[d]);
+                            }
+                            max_score = score;
+                        } else {
+                            float w = std::exp(score - max_score);
+                            sum_exp += w;
+                            for (int d = 0; d < head_dim; d++) {
+                                state.acc[d] += w * fp16_to_fp32(vt[d]);
+                            }
+                        }
+                    }
 
-                float max_score = -1e30f;
-                float sum_exp = 0.0f;
-                //std::vector<float> acc(head_dim, 0.0f);
-                std::fill(state.acc, state.acc + head_dim, 0.0f);
-
-                for (int t = 0; t <= pos; t++) {
-                    const uint16_t* kt = kcache_layer + (size_t)t * kv_dim + kv_h * head_dim;
-                    const uint16_t* vt = vcache_layer + (size_t)t * kv_dim + kv_h * head_dim;
-
-                    float score = 0.0f;
                     for (int d = 0; d < head_dim; d++) {
-                        score += qh[d] * fp16_to_fp32(kt[d]);
-                    }
-                    score /= std::sqrt((float)head_dim);
-
-                    if (score > max_score) {
-                        float correction = std::exp(max_score - score);
-                        sum_exp *= correction;
-                        for (int d = 0; d < head_dim; d++) state.acc[d] *= correction;
-                        sum_exp += 1.0f;
-                        for (int d = 0; d < head_dim; d++) {
-                            state.acc[d] += fp16_to_fp32(vt[d]);
-                        }
-                        max_score = score;
-                    } else {
-                        float w = std::exp(score - max_score);
-                        sum_exp += w;
-                        for (int d = 0; d < head_dim; d++) {
-                            state.acc[d] += w * fp16_to_fp32(vt[d]);
-                        }
+                        xbh[d] = state.acc[d] / sum_exp;
                     }
                 }
 
-                for (int d = 0; d < head_dim; d++) {
-                    xbh[d] = state.acc[d] / sum_exp;
-                }
+                // Attention output projection: xb (attention output) -> xb2 (projected), then x += xb2
+                TensorOps::matmul_bias(state.xb2.data(), state.xb.data(), lw->attn_output,
+                                    state.attn_output_bias[l].data(), q_dim, dim,
+                                    lw->type_attn_output, lw->type_attn_output_b, state.dequant_scratch.data());
+                
+                TensorOps::vec_add(state.x.data(), state.xb2.data(), dim);
+
+                // FFN
+                TensorOps::rmsnorm(state.xb.data(), state.x.data(), state.ffn_norm_w[l].data(), dim);
+                TensorOps::matmul_bias(state.hb.data(), state.xb.data(), lw->ffn_gate,
+                                    state.ffn_gate_bias[l].data(), dim, n_ffn,
+                                    lw->type_ffn_gate, lw->type_ffn_gate_b, state.dequant_scratch.data());
+                TensorOps::silu(state.hb.data(), n_ffn);
+                TensorOps::matmul(state.hb2.data(), state.xb.data(), lw->ffn_up, dim, n_ffn, lw->type_ffn_up);
+                TensorOps::elemwise_mul(state.hb.data(), state.hb.data(), state.hb2.data(), n_ffn);
+                TensorOps::matmul_bias(state.xb.data(), state.hb.data(), lw->ffn_down,
+                                    state.ffn_down_bias[l].data(), n_ffn, dim,
+                                    lw->type_ffn_down, lw->type_ffn_down_b, state.dequant_scratch.data());
+                TensorOps::vec_add(state.x.data(), state.xb.data(), dim);
+                break;}
+                case (layer_type::SSM):{
+                    // 1. SSM (Gated DeltaNet) 替代注意力块
+                    TensorOps::rmsnorm(state.xb.data(), state.x.data(), state.attn_norm_w[l].data(), dim);
+
+                    int qkv_dim = config.n_heads * config.head_dim + 2 * config.n_kv_heads * config.head_dim;
+                    float* curr_conv_state = state.ssm_conv_state.data() + l * (config.ssm_conv_kernel - 1) * qkv_dim;
+                    float* curr_hidden_state = state.ssm_hidden_state.data() + l * config.n_heads * config.head_dim * config.head_dim;
+                    
+                    SSMOps::forward_ssm_step(
+                        state.xb2.data(),      
+                        state.xb.data(),       
+                        lw,                    
+                        dim,
+                        qkv_dim,
+                        config.n_heads,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        config.ssm_conv_kernel,
+                        curr_conv_state,
+                        curr_hidden_state,
+                        state.ssm_norm_w[l].data(),
+                        state.dequant_scratch.data() 
+                    );
+
+                    // 残差连接
+                    TensorOps::vec_add(state.x.data(), state.xb2.data(), dim);
+
+                    // 2. 补充被遗漏的 Post Attention Norm 
+                    TensorOps::rmsnorm(state.xb.data(), state.x.data(), state.post_attn_norm_w[l].data(), dim);
+
+                    // 3. 补充被遗漏的常规 FFN 层！
+                    TensorOps::matmul_bias(state.hb.data(), state.xb.data(), lw->ffn_gate,
+                                        state.ffn_gate_bias[l].data(), dim, n_ffn,
+                                        lw->type_ffn_gate, lw->type_ffn_gate_b, state.dequant_scratch.data());
+                    TensorOps::silu(state.hb.data(), n_ffn);
+                    TensorOps::matmul(state.hb2.data(), state.xb.data(), lw->ffn_up, dim, n_ffn, lw->type_ffn_up);
+                    TensorOps::elemwise_mul(state.hb.data(), state.hb.data(), state.hb2.data(), n_ffn);
+                    TensorOps::matmul_bias(state.xb.data(), state.hb.data(), lw->ffn_down,
+                                        state.ffn_down_bias[l].data(), n_ffn, dim,
+                                        lw->type_ffn_down, lw->type_ffn_down_b, state.dequant_scratch.data());
+                    // FFN 残差连接
+                    TensorOps::vec_add(state.x.data(), state.xb.data(), dim);
+                    break;}
+                default:
+                    throw std::runtime_error("Unsupported layer type");
             }
-
-            // Attention output projection: xb (attention output) -> xb2 (projected), then x += xb2
-            TensorOps::matmul_bias(state.xb2.data(), state.xb.data(), lw->attn_output,
-                                   state.attn_output_bias[l].data(), q_dim, dim,
-                                   lw->type_attn_output, lw->type_attn_output_b, state.dequant_scratch.data());
-            
-            TensorOps::vec_add(state.x.data(), state.xb2.data(), dim);
-
-            // FFN
-            TensorOps::rmsnorm(state.xb.data(), state.x.data(), state.ffn_norm_w[l].data(), dim);
-            TensorOps::matmul_bias(state.hb.data(), state.xb.data(), lw->ffn_gate,
-                                   state.ffn_gate_bias[l].data(), dim, n_ffn,
-                                   lw->type_ffn_gate, lw->type_ffn_gate_b, state.dequant_scratch.data());
-            TensorOps::silu(state.hb.data(), n_ffn);
-            TensorOps::matmul(state.hb2.data(), state.xb.data(), lw->ffn_up, dim, n_ffn, lw->type_ffn_up);
-            TensorOps::elemwise_mul(state.hb.data(), state.hb.data(), state.hb2.data(), n_ffn);
-            TensorOps::matmul_bias(state.xb.data(), state.hb.data(), lw->ffn_down,
-                                   state.ffn_down_bias[l].data(), n_ffn, dim,
-                                   lw->type_ffn_down, lw->type_ffn_down_b, state.dequant_scratch.data());
-            TensorOps::vec_add(state.x.data(), state.xb.data(), dim);
         }
 
         // Final norm and output
@@ -353,6 +438,11 @@ struct Model {
 
     // ------------------- 新增：Layer-wise 批处理前向传播 (用于 Prefill 阶段) -------------------
     float* forward_batch(const std::vector<int>& tokens, int start_pos) {
+        float* ret= nullptr;
+        for(auto i:tokens){
+            ret = forward(i,start_pos++);
+        }
+        return ret;
         int num_tokens = (int)tokens.size();
         if (num_tokens == 0) return nullptr;
 
@@ -747,6 +837,19 @@ private:
                     else if (suffix == "ffn_up.bias") { lw->ffn_up_b = ptr; lw->type_ffn_up_b = qtype; }
                     else if (suffix == "attn_q_norm.weight") { lw->attn_q_norm = ptr; lw->type_attn_q_norm = qtype; }
                     else if (suffix == "attn_k_norm.weight") { lw->attn_k_norm = ptr; lw->type_attn_k_norm = qtype; }
+                    
+                    else if (suffix == "ssm_norm.weight") {lw->type=layer_type::SSM; lw->ssm_norm = ptr; lw->type_ssm_norm = qtype;}
+                    else if (suffix == "ssm_a") { lw->ssm_a = ptr; lw->type_ssm_a = qtype;}
+                    else if (suffix == "ssm_alpha.weight") { lw->ssm_alpha= ptr; lw->type_ssm_alpha = qtype;}
+                    else if (suffix == "ssm_beta.weight") { lw->ssm_beta = ptr; lw->type_ssm_beta = qtype;}
+                    else if (suffix == "ssm_conv1d.weight") { lw->ssm_conv1d = ptr; lw->type_ssm_conv1d = qtype;}
+                    else if (suffix == "ssm_dt.bias") { lw->ssm_dt_bias = ptr; lw->type_ssm_dt_bias = qtype;}
+                    else if (suffix == "ssm_out.weight") { lw->ssm_out = ptr; lw->type_ssm_out = qtype;}
+
+                    else if (suffix == "attn_qkv.weight") { lw->attn_qkv = ptr; lw->type_attn_qkv = qtype; }
+                    else if (suffix == "attn_gate.weight") { lw->attn_gate = ptr; lw->type_attn_gate = qtype; }
+                    else if (suffix == "post_attention_norm.weight") { lw->post_attention_norm = ptr; lw->type_post_attention_norm = qtype; }
+
                 }
             }
         }
@@ -786,7 +889,8 @@ private:
         int q_dim = config.n_heads * config.head_dim;
         int kv_dim = config.n_kv_heads * config.head_dim;
         int half_dim = config.head_dim / 2;
-        int max_scratch = std::max({dim, q_dim, n_ffn, config.vocab_size});
+        int ssm_inner = config.ssm_inner_size;
+        int max_scratch = std::max({dim, 2 * q_dim, n_ffn, config.vocab_size, ssm_inner * 6}); 
 
         state.x.resize((size_t)max_scratch, 0.0f);
         state.xb.resize((size_t)max_scratch, 0.0f);
@@ -867,11 +971,42 @@ private:
             }
         }
 
+        state.attn_norm_w.resize((size_t)config.n_layers);
+        state.ffn_norm_w.resize((size_t)config.n_layers);
+        state.post_attn_norm_w.resize((size_t)config.n_layers);
+        state.ssm_norm_w.resize((size_t)config.n_layers);
+        state.output_norm_w.resize((size_t)dim);
+
+        for (int l = 0; l < config.n_layers; l++) {
+            state.attn_norm_w[l].resize((size_t)dim);
+            state.ffn_norm_w[l].resize((size_t)dim);
+            state.post_attn_norm_w[l].resize((size_t)dim, 0.0f);
+            state.ssm_norm_w[l].resize((size_t)config.head_dim, 0.0f);
+
+            if (weights.layers[l].type_attn_norm != GGUFType::NONE)
+                dequantize_row(weights.layers[l].attn_norm, state.attn_norm_w[l].data(), dim, weights.layers[l].type_attn_norm);
+            if (weights.layers[l].type_ffn_norm != GGUFType::NONE)
+                dequantize_row(weights.layers[l].ffn_norm, state.ffn_norm_w[l].data(), dim, weights.layers[l].type_ffn_norm);
+            
+            // 新增加载
+            if (weights.layers[l].post_attention_norm && weights.layers[l].type_post_attention_norm != GGUFType::NONE)
+                dequantize_row(weights.layers[l].post_attention_norm, state.post_attn_norm_w[l].data(), dim, weights.layers[l].type_post_attention_norm);
+            if (weights.layers[l].ssm_norm && weights.layers[l].type_ssm_norm != GGUFType::NONE)
+                dequantize_row(weights.layers[l].ssm_norm, state.ssm_norm_w[l].data(), config.head_dim, weights.layers[l].type_ssm_norm);
+        }
+
         // KV Cache - use config.max_seq_len for proper indexing
+        size_t num_attn_layers = config.n_layers;  // Assuming all layers have attention; adjust if not
         size_t kv_elements = (size_t)config.n_layers * (size_t)config.max_seq_len * (size_t)kv_dim;
         state.key_cache.resize(kv_elements, 0);
         state.val_cache.resize(kv_elements, 0);
 
+        int num_ssm_layers = config.n_layers;// - num_attn_layers;
+        // 1D 卷积缓存: 每一层需要保存前 (kernel_size - 1) 个 token 的隐状态
+        state.ssm_conv_state.resize(num_ssm_layers * (config.ssm_conv_kernel - 1) * config.ssm_inner_size, 0.0f);
+        // SSM 循环隐状态: h_t 矩阵
+        state.ssm_hidden_state.resize(num_ssm_layers * config.ssm_inner_size * config.ssm_state_size, 0.0f);
+        
         // RoPE tables
         for (int pos = 0; pos < config.max_seq_len; pos++) {
             float* cos_row = state.rope_cos.data() + (size_t)pos * half_dim;
@@ -885,7 +1020,9 @@ private:
 
         state.mem_size = state.x.capacity() * sizeof(float) * 8 +
                         state.rope_cos.capacity() * sizeof(float) * 2 +
-                        kv_elements * sizeof(uint16_t) * 2;
+                        kv_elements * sizeof(uint16_t) * 2 +
+                        state.ssm_conv_state.capacity() * sizeof(float) +
+                        state.ssm_hidden_state.capacity() * sizeof(float);
 
         fprintf(stderr, "Allocating %.2f MB for runtime state\n", state.mem_size / (1024.0 * 1024.0));
         return 0;
