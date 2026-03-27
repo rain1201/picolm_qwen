@@ -5,11 +5,14 @@
 #include "tensor.hpp"
 #include "tokenizer.hpp"
 #include "prefetcher.hpp"
+#include "gguf_metadata.hpp"
 #include <cstdint>
 #include <cstring>
 #include <vector>
 #include <cmath>
 #include <fstream>
+#include <unordered_map>
+#include <memory>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -21,109 +24,174 @@
 #endif
 
 constexpr uint32_t GGUF_MAGIC = 0x46554747;
-constexpr uint32_t KVCACHE_MAGIC = 0x4B564350;
 constexpr int MAX_LAYERS = 64;
 
+// 配置键名常量
+namespace cfg {
+    constexpr const char* N_EMBD = "n_embd";
+    constexpr const char* N_FFN = "n_ffn";
+    constexpr const char* N_HEADS = "n_heads";
+    constexpr const char* N_KV_HEADS = "n_kv_heads";
+    constexpr const char* N_LAYERS = "n_layers";
+    constexpr const char* VOCAB_SIZE = "vocab_size";
+    constexpr const char* MAX_SEQ_LEN = "max_seq_len";
+    constexpr const char* HEAD_DIM = "head_dim";
+    constexpr const char* ROPE_FREQ_BASE = "rope_freq_base";
+    constexpr const char* ALIGNMENT = "alignment";
+    constexpr const char* WEIGHT_TYPE = "weight_type";
+    constexpr const char* USE_PREFETCH = "use_prefetch";
+    constexpr const char* USE_EVICT = "use_evict";
+}
+
+// 辅助函数声明（在 gguf_metadata.hpp 中定义）
+using parser::getInt;
+using parser::getFloat;
+using parser::getUint;
+using parser::getBool;
+
+// 层权重键名常量
+namespace layer {
+    constexpr const char* ATTN_NORM = "attn_norm";
+    constexpr const char* FFN_NORM = "ffn_norm";
+    constexpr const char* ATTN_Q = "attn_q";
+    constexpr const char* ATTN_K = "attn_k";
+    constexpr const char* ATTN_V = "attn_v";
+    constexpr const char* ATTN_OUTPUT = "attn_output";
+    constexpr const char* ATTN_Q_B = "attn_q_b";
+    constexpr const char* ATTN_K_B = "attn_k_b";
+    constexpr const char* ATTN_V_B = "attn_v_b";
+    constexpr const char* ATTN_OUTPUT_B = "attn_output_b";
+    constexpr const char* ATTN_Q_NORM = "attn_q_norm";
+    constexpr const char* ATTN_K_NORM = "attn_k_norm";
+    constexpr const char* FFN_GATE = "ffn_gate";
+    constexpr const char* FFN_DOWN = "ffn_down";
+    constexpr const char* FFN_UP = "ffn_up";
+    constexpr const char* FFN_GATE_B = "ffn_gate_b";
+    constexpr const char* FFN_DOWN_B = "ffn_down_b";
+    constexpr const char* FFN_UP_B = "ffn_up_b";
+}
+
+// Prefetch 权重列表（按访问顺序）
+inline const std::vector<std::pair<const char*, bool>> PREFETCH_KEYS = {
+    {layer::ATTN_Q,       false},  // attn_size
+    {layer::ATTN_K,       false},  // attn_size
+    {layer::ATTN_V,       false},  // attn_size
+    {layer::ATTN_OUTPUT,  false},  // attn_size
+    {layer::FFN_GATE,     true},   // ffn_size
+    {layer::FFN_UP,       true},   // ffn_size
+    {layer::FFN_DOWN,     true},   // ffn_size
+};
+
+// Evict 权重列表（按驱逐顺序）
+inline const std::vector<std::pair<const char*, bool>> EVICT_KEYS = {
+    {layer::ATTN_Q,       false},  // attn_size
+    {layer::ATTN_K,       false},  // kv_size
+    {layer::ATTN_V,       false},  // kv_size
+    {layer::ATTN_OUTPUT,  false},  // q_dim * dim
+    {layer::FFN_GATE,     true},   // ffn_size
+    {layer::FFN_UP,       true},   // ffn_size
+    {layer::FFN_DOWN,     true},   // n_ffn * dim
+};
+
+// 输出层权重键名常量
+namespace output {
+    constexpr const char* TOKEN_EMBD = "token_embd";
+    constexpr const char* OUTPUT_NORM = "output_norm";
+    constexpr const char* OUTPUT = "output";
+}
+
+// ============================================================================
+// 模型配置（直接读写 map）
+// ============================================================================
 struct ModelConfig {
-    int n_embd = 0;
-    int n_ffn = 0;
-    int n_heads = 0;
-    int n_kv_heads = 0;
-    int n_layers = 0;
-    int vocab_size = 0;
-    int max_seq_len = 2048;
-    int head_dim = 0;
-    float rope_freq_base = 10000.0f;
-    int alignment = 32;
-    GGUFType weight_type = GGUFType::F16;
-    bool use_prefetch = false;
-    bool use_evict = false;
+    metadata::ModelConfig config;
+    
+    // 访问底层 map
+    auto& ints() { return config.ints; }
+    auto& floats() { return config.floats; }
+    auto& uints() { return config.uints; }
+    auto& metadata() { return config.metadata; }
+    const auto& ints() const { return config.ints; }
+    const auto& floats() const { return config.floats; }
+    const auto& uints() const { return config.uints; }
+    const auto& metadata() const { return config.metadata; }
 };
 
-struct LayerWeights {
-    const void* attn_norm = nullptr;
-    const void* attn_q = nullptr;
-    const void* attn_k = nullptr;
-    const void* attn_v = nullptr;
-    const void* attn_q_b = nullptr;
-    const void* attn_k_b = nullptr;
-    const void* attn_v_b = nullptr;
-    const void* attn_output_b = nullptr;
-    const void* ffn_gate_b = nullptr;
-    const void* ffn_down_b = nullptr;
-    const void* ffn_up_b = nullptr;
-    const void* attn_q_norm = nullptr;
-    const void* attn_k_norm = nullptr;
-    const void* attn_output = nullptr;
-    const void* ffn_norm = nullptr;
-    const void* ffn_gate = nullptr;
-    const void* ffn_down = nullptr;
-    const void* ffn_up = nullptr;
-    GGUFType type_attn_norm = GGUFType::NONE;
-    GGUFType type_attn_q = GGUFType::NONE;
-    GGUFType type_attn_k = GGUFType::NONE;
-    GGUFType type_attn_v = GGUFType::NONE;
-    GGUFType type_attn_output = GGUFType::NONE;
-    GGUFType type_ffn_norm = GGUFType::NONE;
-    GGUFType type_ffn_gate = GGUFType::NONE;
-    GGUFType type_ffn_down = GGUFType::NONE;
-    GGUFType type_ffn_up = GGUFType::NONE;
-    GGUFType type_attn_q_b = GGUFType::NONE;
-    GGUFType type_attn_k_b = GGUFType::NONE;
-    GGUFType type_attn_v_b = GGUFType::NONE;
-    GGUFType type_attn_output_b = GGUFType::NONE;
-    GGUFType type_ffn_gate_b = GGUFType::NONE;
-    GGUFType type_ffn_down_b = GGUFType::NONE;
-    GGUFType type_ffn_up_b = GGUFType::NONE;
-    GGUFType type_attn_q_norm = GGUFType::NONE;
-    GGUFType type_attn_k_norm = GGUFType::NONE;
-};
+// ============================================================================
+// 层权重（完全基于 map）
+// ============================================================================
+using LayerWeights = metadata::LayerWeights;
 
+// ============================================================================
+// 模型权重（完全基于 map）
+// ============================================================================
 struct ModelWeights {
-    const void* token_embd = nullptr;
-    GGUFType type_token_embd = GGUFType::NONE;
-    const void* output_norm = nullptr;
-    GGUFType type_output_norm = GGUFType::NONE;
-    const void* output = nullptr;
-    GGUFType type_output = GGUFType::NONE;
+    metadata::ModelWeightMap weights;
     LayerWeights layers[MAX_LAYERS];
+    
+    void set(const std::string& name, const void* ptr, uint32_t type) {
+        if (ptr) {
+            weights[name] = metadata::WeightEntry{ptr, type};
+        }
+    }
+    
+    metadata::WeightEntry get(const std::string& name) const {
+        auto it = weights.find(name);
+        return (it != weights.end()) ? it->second : metadata::WeightEntry{};
+    }
+    
+    LayerWeights& get_layer(int layer_id) {
+        return layers[layer_id];
+    }
+    
+    const LayerWeights& get_layer(int layer_id) const {
+        return layers[layer_id];
+    }
 };
 
+// ============================================================================
+// 运行状态
+// ============================================================================
 struct RunState {
     std::vector<float> x, xb, xb2, q, hb, hb2, logits;
     std::vector<uint16_t> key_cache, val_cache;
     std::vector<float> dequant_scratch;
     std::vector<float> rope_cos, rope_sin;
     std::vector<float> norm_weights;
+    
+    // 按层存储的归一化权重和偏置
     std::vector<std::vector<float>> attn_norm_w, ffn_norm_w;
     std::vector<std::vector<float>> attn_q_bias, attn_k_bias, attn_v_bias, attn_output_bias;
     std::vector<std::vector<float>> ffn_gate_bias, ffn_up_bias, ffn_down_bias;
     std::vector<float> output_norm_w;
     std::vector<std::vector<float>> attn_q_norm_w, attn_k_norm_w;
-    float acc[512];
     
+    float acc[512];
     size_t mem_size = 0;
 };
 
 using RopeFn = void(*)(float*, float*, int, int, int, const float*, const float*);
 
+// ============================================================================
+// 模型主类
+// ============================================================================
 struct Model {
     ModelConfig config;
     ModelWeights weights;
     RunState state;
-    
+
     void* mmap_addr = nullptr;
     size_t mmap_size = 0;
-    
+
     const void* tok_tokens_data = nullptr;
     uint64_t tok_n_tokens = 0;
     const void* tok_scores_data = nullptr;
     uint64_t tok_n_scores = 0;
     uint32_t tok_bos_id = 1;
     uint32_t tok_eos_id = 2;
-    
+
     RopeFn rope_fn = nullptr;
-    
+
 #ifdef _WIN32
     HANDLE file_handle = nullptr;
     HANDLE map_handle = nullptr;
@@ -134,9 +202,8 @@ struct Model {
     ~Model() { free(); }
 
     int load(const char* path, int max_seq_len_override = 0, bool prefetch = false, bool evict = false) {
-        weights = ModelWeights();  // Zero-initialize
-        config.use_prefetch = prefetch;
-        config.use_evict = evict;
+        config.ints()[cfg::USE_PREFETCH] = prefetch ? 1 : 0;
+        config.ints()[cfg::USE_EVICT] = evict ? 1 : 0;
 
         if (mmap_file(path) != 0) return -1;
         if (parse_gguf(max_seq_len_override) != 0) return -1;
@@ -146,39 +213,40 @@ struct Model {
     }
 
     void prefetch(int l) {
-        int dim = config.n_embd;
-        int n_ffn = config.n_ffn;
-        int head_dim = config.head_dim;
-        int n_heads = config.n_heads;
+        if (!getBool(config.ints(), cfg::USE_PREFETCH) || l + 1 >= getInt(config.ints(), cfg::N_LAYERS)) {
+            return;
+        }
+
+        int dim = getInt(config.ints(), cfg::N_EMBD);
+        int n_ffn = getInt(config.ints(), cfg::N_FFN);
+        int head_dim = getInt(config.ints(), cfg::HEAD_DIM);
+        int n_heads = getInt(config.ints(), cfg::N_HEADS);
         int q_dim = n_heads * head_dim;
 
+        LayerWeights& next_lw = weights.get_layer(l + 1);
+        size_t attn_size = (size_t)gguf_type_row_size((GGUFType)next_lw.get(layer::ATTN_Q).type, dim) * q_dim;
+        size_t ffn_size = (size_t)gguf_type_row_size((GGUFType)next_lw.get(layer::FFN_GATE).type, dim) * n_ffn;
 
-        // 预取下一层
-        if (config.use_prefetch && l + 1 < config.n_layers) {
-            LayerWeights* next_lw = &weights.layers[l + 1];
-            size_t attn_size = (size_t)gguf_type_row_size(next_lw->type_attn_q, dim) * q_dim;
-            size_t ffn_size = (size_t)gguf_type_row_size(next_lw->type_ffn_gate, dim) * n_ffn;
-            MemoryPrefetcher::prefetch_layer(next_lw->attn_q, attn_size);
-            MemoryPrefetcher::prefetch_layer(next_lw->attn_k, attn_size);
-            MemoryPrefetcher::prefetch_layer(next_lw->attn_v, attn_size);
-            MemoryPrefetcher::prefetch_layer(next_lw->attn_output, attn_size);
-            MemoryPrefetcher::prefetch_layer(next_lw->ffn_gate, ffn_size);
-            MemoryPrefetcher::prefetch_layer(next_lw->ffn_up, ffn_size);
-            MemoryPrefetcher::prefetch_layer(next_lw->ffn_down, ffn_size);
+        for (const auto& [key, use_ffn_size] : PREFETCH_KEYS) {
+            size_t size = use_ffn_size ? ffn_size : attn_size;
+            MemoryPrefetcher::prefetch_layer(next_lw.get(key).ptr, size);
         }
     }
 
-    void evict(int l){
-        LayerWeights* lw = &weights.layers[l];
-        int dim = config.n_embd;
-        int n_ffn = config.n_ffn;
-        int head_dim = config.head_dim;
-        int n_heads = config.n_heads;
-        int q_dim = n_heads * head_dim;
-        int kv_dim = config.n_kv_heads * head_dim;
+    void evict(int l) {
+        if (!getBool(config.ints(), cfg::USE_EVICT)) {
+            return;
+        }
 
-        // 定义操作系统级内存驱逐 Helper (用后即弃)
-        auto evict_tensor =[](const void* ptr, size_t size) {
+        LayerWeights& lw = weights.get_layer(l);
+        int dim = getInt(config.ints(), cfg::N_EMBD);
+        int n_ffn = getInt(config.ints(), cfg::N_FFN);
+        int head_dim = getInt(config.ints(), cfg::HEAD_DIM);
+        int n_heads = getInt(config.ints(), cfg::N_HEADS);
+        int q_dim = n_heads * head_dim;
+        int kv_dim = getInt(config.ints(), cfg::N_KV_HEADS) * head_dim;
+
+        auto evict_tensor = [](const void* ptr, size_t size) {
             if (!ptr || size == 0) return;
 #ifdef _WIN32
             VirtualUnlock((LPVOID)ptr, size);
@@ -187,23 +255,30 @@ struct Model {
 #endif
         };
 
-        if (config.use_evict) {
-                evict_tensor(lw->attn_q,      gguf_type_row_size(lw->type_attn_q, dim) * q_dim);
-                evict_tensor(lw->attn_k,      gguf_type_row_size(lw->type_attn_k, dim) * kv_dim);
-                evict_tensor(lw->attn_v,      gguf_type_row_size(lw->type_attn_v, dim) * kv_dim);
-                evict_tensor(lw->attn_output, gguf_type_row_size(lw->type_attn_output, q_dim) * dim);
-                evict_tensor(lw->ffn_gate,    gguf_type_row_size(lw->type_ffn_gate, dim) * n_ffn);
-                evict_tensor(lw->ffn_up,      gguf_type_row_size(lw->type_ffn_up, dim) * n_ffn);
-                evict_tensor(lw->ffn_down,    gguf_type_row_size(lw->type_ffn_down, n_ffn) * dim);
+        // 计算各权重的大小
+        auto get_size = [&](const char* key) -> size_t {
+            auto entry = lw.get(key);
+            if (strcmp(key, layer::ATTN_Q) == 0) return gguf_type_row_size((GGUFType)entry.type, dim) * q_dim;
+            if (strcmp(key, layer::ATTN_K) == 0) return gguf_type_row_size((GGUFType)entry.type, dim) * kv_dim;
+            if (strcmp(key, layer::ATTN_V) == 0) return gguf_type_row_size((GGUFType)entry.type, dim) * kv_dim;
+            if (strcmp(key, layer::ATTN_OUTPUT) == 0) return gguf_type_row_size((GGUFType)entry.type, q_dim) * dim;
+            if (strcmp(key, layer::FFN_GATE) == 0) return gguf_type_row_size((GGUFType)entry.type, dim) * n_ffn;
+            if (strcmp(key, layer::FFN_UP) == 0) return gguf_type_row_size((GGUFType)entry.type, dim) * n_ffn;
+            if (strcmp(key, layer::FFN_DOWN) == 0) return gguf_type_row_size((GGUFType)entry.type, n_ffn) * dim;
+            return (size_t)0;
+        };
+
+        for (const auto& [key, _] : EVICT_KEYS) {
+            evict_tensor(lw.get(key).ptr, get_size(key));
         }
     }
 
     float* forward(int token, int pos) {
-        int dim = config.n_embd;
-        int n_ffn = config.n_ffn;
-        int n_heads = config.n_heads;
-        int n_kv_heads = config.n_kv_heads;
-        int head_dim = config.head_dim;
+        int dim = getInt(config.ints(), cfg::N_EMBD);
+        int n_ffn = getInt(config.ints(), cfg::N_FFN);
+        int n_heads = getInt(config.ints(), cfg::N_HEADS);
+        int n_kv_heads = getInt(config.ints(), cfg::N_KV_HEADS);
+        int head_dim = getInt(config.ints(), cfg::HEAD_DIM);
         int kv_dim = n_kv_heads * head_dim;
         int kv_mul = n_heads / n_kv_heads;
         int half_dim = head_dim / 2;
@@ -214,40 +289,47 @@ struct Model {
 
         // 1. Embedding lookup
         {
-            size_t row_bytes = gguf_type_row_size(weights.type_token_embd, dim);
-            const void* embd_row = (const uint8_t*)weights.token_embd + (size_t)token * row_bytes;
-            dequantize_row(embd_row, state.x.data(), dim, weights.type_token_embd);
+            auto embd_entry = weights.get(output::TOKEN_EMBD);
+            size_t row_bytes = gguf_type_row_size((GGUFType)embd_entry.type, dim);
+            const void* embd_row = (const uint8_t*)embd_entry.ptr + (size_t)token * row_bytes;
+            dequantize_row(embd_row, state.x.data(), dim, (GGUFType)embd_entry.type);
         }
 
         // 2. Transformer layers
-        for (int l = 0; l < config.n_layers; l++) {
-            LayerWeights* lw = &weights.layers[l];
-            
+        for (int l = 0; l < getInt(config.ints(), cfg::N_LAYERS); l++) {
+            LayerWeights& lw = weights.get_layer(l);
+
             prefetch(l);
 
-            // Attention
+            // Attention norm
             TensorOps::rmsnorm(state.xb.data(), state.x.data(), state.attn_norm_w[l].data(), dim);
-            
+
             // Q projection
-            TensorOps::matmul_bias(state.q.data(), state.xb.data(), lw->attn_q, 
-                                   state.attn_q_bias[l].data(), dim, q_dim, 
-                                   lw->type_attn_q, lw->type_attn_q_b, state.dequant_scratch.data());
-            
-            // QK-Norm for Q (before RoPE)
-            if (lw->attn_q_norm && state.attn_q_norm_w[l].data()) {
+            auto q_entry = lw.get(layer::ATTN_Q);
+            auto q_b_entry = lw.get(layer::ATTN_Q_B);
+            TensorOps::matmul_bias(state.q.data(), state.xb.data(), q_entry.ptr,
+                                   state.attn_q_bias[l].data(), dim, q_dim,
+                                   (GGUFType)q_entry.type, (GGUFType)q_b_entry.type, state.dequant_scratch.data());
+
+            // QK-Norm for Q
+            auto q_norm_entry = lw.get(layer::ATTN_Q_NORM);
+            if (q_norm_entry && state.attn_q_norm_w[l].data()) {
                 for (int h = 0; h < n_heads; h++) {
                     float* qh = state.q.data() + h * head_dim;
                     TensorOps::rmsnorm(qh, qh, state.attn_q_norm_w[l].data(), head_dim);
                 }
             }
-            
-            // K projection (use xb2 as temp buffer)
-            TensorOps::matmul_bias(state.xb2.data(), state.xb.data(), lw->attn_k,
+
+            // K projection
+            auto k_entry = lw.get(layer::ATTN_K);
+            auto k_b_entry = lw.get(layer::ATTN_K_B);
+            TensorOps::matmul_bias(state.xb2.data(), state.xb.data(), k_entry.ptr,
                                    state.attn_k_bias[l].data(), dim, kv_dim,
-                                   lw->type_attn_k, lw->type_attn_k_b, state.dequant_scratch.data());
-            
-            // QK-Norm for K (before RoPE)
-            if (lw->attn_k_norm && state.attn_k_norm_w[l].data()) {
+                                   (GGUFType)k_entry.type, (GGUFType)k_b_entry.type, state.dequant_scratch.data());
+
+            // QK-Norm for K
+            auto k_norm_entry = lw.get(layer::ATTN_K_NORM);
+            if (k_norm_entry && state.attn_k_norm_w[l].data()) {
                 for (int h = 0; h < n_kv_heads; h++) {
                     float* kh = state.xb2.data() + h * head_dim;
                     TensorOps::rmsnorm(kh, kh, state.attn_k_norm_w[l].data(), head_dim);
@@ -258,19 +340,21 @@ struct Model {
             rope_fn(state.q.data(), state.xb2.data(), head_dim, n_heads, n_kv_heads, cos_pos, sin_pos);
 
             // Store K as FP16
-            uint16_t* kcache_layer = state.key_cache.data() + (size_t)l * config.max_seq_len * kv_dim;
+            uint16_t* kcache_layer = state.key_cache.data() + (size_t)l * getInt(config.ints(), cfg::MAX_SEQ_LEN) * kv_dim;
             uint16_t* key_pos_fp16 = kcache_layer + (size_t)pos * kv_dim;
             for (int d = 0; d < kv_dim; d++) {
                 key_pos_fp16[d] = fp32_to_fp16(state.xb2.data()[d]);
             }
 
-            // V projection (reuse xb2 buffer after K is stored)
-            TensorOps::matmul_bias(state.xb2.data(), state.xb.data(), lw->attn_v,
+            // V projection
+            auto v_entry = lw.get(layer::ATTN_V);
+            auto v_b_entry = lw.get(layer::ATTN_V_B);
+            TensorOps::matmul_bias(state.xb2.data(), state.xb.data(), v_entry.ptr,
                                    state.attn_v_bias[l].data(), dim, kv_dim,
-                                   lw->type_attn_v, lw->type_attn_v_b, state.dequant_scratch.data());
-            
+                                   (GGUFType)v_entry.type, (GGUFType)v_b_entry.type, state.dequant_scratch.data());
+
             // Store V as FP16
-            uint16_t* vcache_layer = state.val_cache.data() + (size_t)l * config.max_seq_len * kv_dim;
+            uint16_t* vcache_layer = state.val_cache.data() + (size_t)l * getInt(config.ints(), cfg::MAX_SEQ_LEN) * kv_dim;
             uint16_t* val_pos_fp16 = vcache_layer + (size_t)pos * kv_dim;
             for (int d = 0; d < kv_dim; d++) {
                 val_pos_fp16[d] = fp32_to_fp16(state.xb2.data()[d]);
@@ -278,7 +362,7 @@ struct Model {
 
             // Flash Attention (online softmax)
             std::fill(state.xb.data(), state.xb.data() + q_dim, 0.0f);
-            
+
             for (int h = 0; h < n_heads; h++) {
                 float* qh = state.q.data() + h * head_dim;
                 int kv_h = h / kv_mul;
@@ -286,7 +370,6 @@ struct Model {
 
                 float max_score = -1e30f;
                 float sum_exp = 0.0f;
-                //std::vector<float> acc(head_dim, 0.0f);
                 std::fill(state.acc, state.acc + head_dim, 0.0f);
 
                 for (int t = 0; t <= pos; t++) {
@@ -322,119 +405,133 @@ struct Model {
                 }
             }
 
-            // Attention output projection: xb (attention output) -> xb2 (projected), then x += xb2
-            TensorOps::matmul_bias(state.xb2.data(), state.xb.data(), lw->attn_output,
+            // Attention output projection
+            auto attn_out_entry = lw.get(layer::ATTN_OUTPUT);
+            auto attn_out_b_entry = lw.get(layer::ATTN_OUTPUT_B);
+            TensorOps::matmul_bias(state.xb2.data(), state.xb.data(), attn_out_entry.ptr,
                                    state.attn_output_bias[l].data(), q_dim, dim,
-                                   lw->type_attn_output, lw->type_attn_output_b, state.dequant_scratch.data());
-            
+                                   (GGUFType)attn_out_entry.type, (GGUFType)attn_out_b_entry.type, state.dequant_scratch.data());
+
             TensorOps::vec_add(state.x.data(), state.xb2.data(), dim);
 
             // FFN
             TensorOps::rmsnorm(state.xb.data(), state.x.data(), state.ffn_norm_w[l].data(), dim);
-            TensorOps::matmul_bias(state.hb.data(), state.xb.data(), lw->ffn_gate,
+
+            auto gate_entry = lw.get(layer::FFN_GATE);
+            auto gate_b_entry = lw.get(layer::FFN_GATE_B);
+            TensorOps::matmul_bias(state.hb.data(), state.xb.data(), gate_entry.ptr,
                                    state.ffn_gate_bias[l].data(), dim, n_ffn,
-                                   lw->type_ffn_gate, lw->type_ffn_gate_b, state.dequant_scratch.data());
+                                   (GGUFType)gate_entry.type, (GGUFType)gate_b_entry.type, state.dequant_scratch.data());
             TensorOps::silu(state.hb.data(), n_ffn);
-            TensorOps::matmul(state.hb2.data(), state.xb.data(), lw->ffn_up, dim, n_ffn, lw->type_ffn_up);
+            
+            auto up_entry = lw.get(layer::FFN_UP);
+            TensorOps::matmul(state.hb2.data(), state.xb.data(), up_entry.ptr, dim, n_ffn, (GGUFType)up_entry.type);
             TensorOps::elemwise_mul(state.hb.data(), state.hb.data(), state.hb2.data(), n_ffn);
-            TensorOps::matmul_bias(state.xb.data(), state.hb.data(), lw->ffn_down,
+
+            auto down_entry = lw.get(layer::FFN_DOWN);
+            auto down_b_entry = lw.get(layer::FFN_DOWN_B);
+            TensorOps::matmul_bias(state.xb.data(), state.hb.data(), down_entry.ptr,
                                    state.ffn_down_bias[l].data(), n_ffn, dim,
-                                   lw->type_ffn_down, lw->type_ffn_down_b, state.dequant_scratch.data());
+                                   (GGUFType)down_entry.type, (GGUFType)down_b_entry.type, state.dequant_scratch.data());
             TensorOps::vec_add(state.x.data(), state.xb.data(), dim);
+
+            evict(l);
         }
 
         // Final norm and output
         TensorOps::rmsnorm(state.xb.data(), state.x.data(), state.output_norm_w.data(), dim);
-        TensorOps::matmul(state.logits.data(), state.xb.data(), weights.output, 
-                         dim, config.vocab_size, weights.type_output);
+        auto output_entry = weights.get(output::OUTPUT);
+        TensorOps::matmul(state.logits.data(), state.xb.data(), output_entry.ptr,
+                         dim, getInt(config.ints(), cfg::VOCAB_SIZE), (GGUFType)output_entry.type);
 
         return state.logits.data();
     }
 
-    // ------------------- 新增：Layer-wise 批处理前向传播 (用于 Prefill 阶段) -------------------
     float* forward_batch(const std::vector<int>& tokens, int start_pos) {
         int num_tokens = (int)tokens.size();
         if (num_tokens == 0) return nullptr;
 
-        int dim = config.n_embd;
-        int n_ffn = config.n_ffn;
-        int n_heads = config.n_heads;
-        int n_kv_heads = config.n_kv_heads;
-        int head_dim = config.head_dim;
+        int dim = getInt(config.ints(), cfg::N_EMBD);
+        int n_ffn = getInt(config.ints(), cfg::N_FFN);
+        int n_heads = getInt(config.ints(), cfg::N_HEADS);
+        int n_kv_heads = getInt(config.ints(), cfg::N_KV_HEADS);
+        int head_dim = getInt(config.ints(), cfg::HEAD_DIM);
         int kv_dim = n_kv_heads * head_dim;
         int kv_mul = n_heads / n_kv_heads;
         int half_dim = head_dim / 2;
         int q_dim = n_heads * head_dim;
 
-        // 为这一批 token 分配跨层的中间状态 Buffer
-        // 大小为 num_tokens * dim，通常只有几十MB，完全可以放进内存
         std::vector<float> batch_x((size_t)num_tokens * dim, 0.0f);
 
-        // 1. 一次性完成所有 Token 的 Embedding Lookup
-        for (int i = 0; i < num_tokens; i++) {
-            size_t row_bytes = gguf_type_row_size(weights.type_token_embd, dim);
-            const void* embd_row = (const uint8_t*)weights.token_embd + (size_t)tokens[i] * row_bytes;
-            dequantize_row(embd_row, batch_x.data() + (size_t)i * dim, dim, weights.type_token_embd);
+        // 1. Embedding lookup
+        {
+            auto embd_entry = weights.get(output::TOKEN_EMBD);
+            size_t row_bytes = gguf_type_row_size((GGUFType)embd_entry.type, dim);
+            for (int i = 0; i < num_tokens; i++) {
+                const void* embd_row = (const uint8_t*)embd_entry.ptr + (size_t)tokens[i] * row_bytes;
+                dequantize_row(embd_row, batch_x.data() + (size_t)i * dim, dim, (GGUFType)embd_entry.type);
+            }
         }
 
-
-        // 2. Transformer 层循环 (外层为 Layer，内层为 Token)
-        for (int l = 0; l < config.n_layers; l++) {
-            LayerWeights* lw = &weights.layers[l];
-
+        // 2. Transformer layers
+        for (int l = 0; l < getInt(config.ints(), cfg::N_LAYERS); l++) {
+            LayerWeights& lw = weights.get_layer(l);
             prefetch(l);
 
-            // 对该层依次处理所有 Token
             for (int i = 0; i < num_tokens; i++) {
                 int pos = start_pos + i;
-                
-                // 将当前 Token 的状态载入 state.x 以复用后续的单 Token 运算逻辑
                 std::memcpy(state.x.data(), batch_x.data() + (size_t)i * dim, dim * sizeof(float));
 
-                // ---------- Attention ----------
+                // Attention norm
                 TensorOps::rmsnorm(state.xb.data(), state.x.data(), state.attn_norm_w[l].data(), dim);
-                
-                // Q, K, V 计算...
-                TensorOps::matmul_bias(state.q.data(), state.xb.data(), lw->attn_q, 
-                                       state.attn_q_bias[l].data(), dim, q_dim, 
-                                       lw->type_attn_q, lw->type_attn_q_b, state.dequant_scratch.data());
-                
-                if (lw->attn_q_norm && state.attn_q_norm_w[l].data()) {
+
+                // Q, K, V
+                auto q_entry = lw.get(layer::ATTN_Q);
+                auto q_b_entry = lw.get(layer::ATTN_Q_B);
+                TensorOps::matmul_bias(state.q.data(), state.xb.data(), q_entry.ptr,
+                                       state.attn_q_bias[l].data(), dim, q_dim,
+                                       (GGUFType)q_entry.type, (GGUFType)q_b_entry.type, state.dequant_scratch.data());
+
+                auto q_norm_entry = lw.get(layer::ATTN_Q_NORM);
+                if (q_norm_entry && state.attn_q_norm_w[l].data()) {
                     for (int h = 0; h < n_heads; h++) {
                         float* qh = state.q.data() + h * head_dim;
                         TensorOps::rmsnorm(qh, qh, state.attn_q_norm_w[l].data(), head_dim);
                     }
                 }
-                
-                TensorOps::matmul_bias(state.xb2.data(), state.xb.data(), lw->attn_k,
+
+                auto k_entry = lw.get(layer::ATTN_K);
+                auto k_b_entry = lw.get(layer::ATTN_K_B);
+                TensorOps::matmul_bias(state.xb2.data(), state.xb.data(), k_entry.ptr,
                                        state.attn_k_bias[l].data(), dim, kv_dim,
-                                       lw->type_attn_k, lw->type_attn_k_b, state.dequant_scratch.data());
-                
-                if (lw->attn_k_norm && state.attn_k_norm_w[l].data()) {
+                                       (GGUFType)k_entry.type, (GGUFType)k_b_entry.type, state.dequant_scratch.data());
+
+                auto k_norm_entry = lw.get(layer::ATTN_K_NORM);
+                if (k_norm_entry && state.attn_k_norm_w[l].data()) {
                     for (int h = 0; h < n_kv_heads; h++) {
                         float* kh = state.xb2.data() + h * head_dim;
                         TensorOps::rmsnorm(kh, kh, state.attn_k_norm_w[l].data(), head_dim);
                     }
                 }
 
-                // RoPE
                 const float* cos_pos = state.rope_cos.data() + (size_t)pos * half_dim;
                 const float* sin_pos = state.rope_sin.data() + (size_t)pos * half_dim;
                 rope_fn(state.q.data(), state.xb2.data(), head_dim, n_heads, n_kv_heads, cos_pos, sin_pos);
 
-                // 将 K 存入 KV Cache
-                uint16_t* kcache_layer = state.key_cache.data() + (size_t)l * config.max_seq_len * kv_dim;
+                // Store K, V
+                uint16_t* kcache_layer = state.key_cache.data() + (size_t)l * getInt(config.ints(), cfg::MAX_SEQ_LEN) * kv_dim;
                 uint16_t* key_pos_fp16 = kcache_layer + (size_t)pos * kv_dim;
                 for (int d = 0; d < kv_dim; d++) {
                     key_pos_fp16[d] = fp32_to_fp16(state.xb2.data()[d]);
                 }
 
-                TensorOps::matmul_bias(state.xb2.data(), state.xb.data(), lw->attn_v,
+                auto v_entry = lw.get(layer::ATTN_V);
+                auto v_b_entry = lw.get(layer::ATTN_V_B);
+                TensorOps::matmul_bias(state.xb2.data(), state.xb.data(), v_entry.ptr,
                                        state.attn_v_bias[l].data(), dim, kv_dim,
-                                       lw->type_attn_v, lw->type_attn_v_b, state.dequant_scratch.data());
-                
-                // 将 V 存入 KV Cache
-                uint16_t* vcache_layer = state.val_cache.data() + (size_t)l * config.max_seq_len * kv_dim;
+                                       (GGUFType)v_entry.type, (GGUFType)v_b_entry.type, state.dequant_scratch.data());
+
+                uint16_t* vcache_layer = state.val_cache.data() + (size_t)l * getInt(config.ints(), cfg::MAX_SEQ_LEN) * kv_dim;
                 uint16_t* val_pos_fp16 = vcache_layer + (size_t)pos * kv_dim;
                 for (int d = 0; d < kv_dim; d++) {
                     val_pos_fp16[d] = fp32_to_fp16(state.xb2.data()[d]);
@@ -466,12 +563,16 @@ struct Model {
                             sum_exp *= correction;
                             for (int d = 0; d < head_dim; d++) state.acc[d] *= correction;
                             sum_exp += 1.0f;
-                            for (int d = 0; d < head_dim; d++) state.acc[d] += fp16_to_fp32(vt[d]);
+                            for (int d = 0; d < head_dim; d++) {
+                                state.acc[d] += fp16_to_fp32(vt[d]);
+                            }
                             max_score = score;
                         } else {
                             float w = std::exp(score - max_score);
                             sum_exp += w;
-                            for (int d = 0; d < head_dim; d++) state.acc[d] += w * fp16_to_fp32(vt[d]);
+                            for (int d = 0; d < head_dim; d++) {
+                                state.acc[d] += w * fp16_to_fp32(vt[d]);
+                            }
                         }
                     }
                     for (int d = 0; d < head_dim; d++) {
@@ -479,37 +580,45 @@ struct Model {
                     }
                 }
 
-                // 输出映射
-                TensorOps::matmul_bias(state.xb2.data(), state.xb.data(), lw->attn_output,
+                auto attn_out_entry = lw.get(layer::ATTN_OUTPUT);
+                auto attn_out_b_entry = lw.get(layer::ATTN_OUTPUT_B);
+                TensorOps::matmul_bias(state.xb2.data(), state.xb.data(), attn_out_entry.ptr,
                                        state.attn_output_bias[l].data(), q_dim, dim,
-                                       lw->type_attn_output, lw->type_attn_output_b, state.dequant_scratch.data());
+                                       (GGUFType)attn_out_entry.type, (GGUFType)attn_out_b_entry.type, state.dequant_scratch.data());
                 TensorOps::vec_add(state.x.data(), state.xb2.data(), dim);
 
-                // ---------- FFN ----------
+                // FFN
                 TensorOps::rmsnorm(state.xb.data(), state.x.data(), state.ffn_norm_w[l].data(), dim);
-                TensorOps::matmul_bias(state.hb.data(), state.xb.data(), lw->ffn_gate,
+
+                auto gate_entry = lw.get(layer::FFN_GATE);
+                auto gate_b_entry = lw.get(layer::FFN_GATE_B);
+                TensorOps::matmul_bias(state.hb.data(), state.xb.data(), gate_entry.ptr,
                                        state.ffn_gate_bias[l].data(), dim, n_ffn,
-                                       lw->type_ffn_gate, lw->type_ffn_gate_b, state.dequant_scratch.data());
+                                       (GGUFType)gate_entry.type, (GGUFType)gate_b_entry.type, state.dequant_scratch.data());
                 TensorOps::silu(state.hb.data(), n_ffn);
-                TensorOps::matmul(state.hb2.data(), state.xb.data(), lw->ffn_up, dim, n_ffn, lw->type_ffn_up);
+
+                auto up_entry = lw.get(layer::FFN_UP);
+                TensorOps::matmul(state.hb2.data(), state.xb.data(), up_entry.ptr, dim, n_ffn, (GGUFType)up_entry.type);
                 TensorOps::elemwise_mul(state.hb.data(), state.hb.data(), state.hb2.data(), n_ffn);
-                TensorOps::matmul_bias(state.xb.data(), state.hb.data(), lw->ffn_down,
+
+                auto down_entry = lw.get(layer::FFN_DOWN);
+                auto down_b_entry = lw.get(layer::FFN_DOWN_B);
+                TensorOps::matmul_bias(state.xb.data(), state.hb.data(), down_entry.ptr,
                                        state.ffn_down_bias[l].data(), n_ffn, dim,
-                                       lw->type_ffn_down, lw->type_ffn_down_b, state.dequant_scratch.data());
+                                       (GGUFType)down_entry.type, (GGUFType)down_b_entry.type, state.dequant_scratch.data());
                 TensorOps::vec_add(state.x.data(), state.xb.data(), dim);
 
-                // 算完了，把状态写回 batch_x
                 std::memcpy(batch_x.data() + (size_t)i * dim, state.x.data(), dim * sizeof(float));
-            } // end of token loop
-
+            }
             evict(l);
-        } // end of layer loop
+        }
 
-        // 3. Final norm and output (只计算最后一个 Token 的 Logits 即可)
+        // Final norm and output
         std::memcpy(state.x.data(), batch_x.data() + (size_t)(num_tokens - 1) * dim, dim * sizeof(float));
         TensorOps::rmsnorm(state.xb.data(), state.x.data(), state.output_norm_w.data(), dim);
-        TensorOps::matmul(state.logits.data(), state.xb.data(), weights.output, 
-                         dim, config.vocab_size, weights.type_output);
+        auto output_entry = weights.get(output::OUTPUT);
+        TensorOps::matmul(state.logits.data(), state.xb.data(), output_entry.ptr,
+                         dim, getInt(config.ints(), cfg::VOCAB_SIZE), (GGUFType)output_entry.type);
 
         return state.logits.data();
     }
@@ -563,18 +672,24 @@ private:
         size_t pos = 0;
 
         uint32_t magic; std::memcpy(&magic, data + pos, 4); pos += 4;
-        if (magic != GGUF_MAGIC) return -1;
+        if (magic != GGUF_MAGIC) {
+            fprintf(stderr, "Invalid GGUF magic: 0x%08X\n", magic);
+            return -1;
+        }
 
         uint32_t version; std::memcpy(&version, data + pos, 4); pos += 4;
-        if (version < 2 || version > 3) return -1;
+        if (version < 2 || version > 3) {
+            fprintf(stderr, "Invalid GGUF version: %u\n", version);
+            return -1;
+        }
 
         uint64_t n_tensors, n_metadata;
         std::memcpy(&n_tensors, data + pos, 8); pos += 8;
         std::memcpy(&n_metadata, data + pos, 8); pos += 8;
 
-        config.rope_freq_base = 10000.0f;
-        config.max_seq_len = 2048;
-        config.head_dim = -1;
+        config.floats()[cfg::ROPE_FREQ_BASE] = 10000.0f;
+        config.ints()[cfg::MAX_SEQ_LEN] = 2048;
+        config.ints()[cfg::HEAD_DIM] = -1;
 
         // Parse metadata
         for (uint64_t i = 0; i < n_metadata; i++) {
@@ -590,18 +705,18 @@ private:
 
             auto skip_value = [&]() {
                 switch (vtype) {
-                    case 0: case 1: case 7: pos += 1; break;  // UINT8, INT8, BOOL
-                    case 2: case 3: pos += 2; break;  // UINT16, INT16
-                    case 4: case 5: pos += 4; break;  // UINT32, INT32
-                    case 10: case 11: pos += 8; break;  // UINT64, INT64
-                    case 6: pos += 4; break;  // FLOAT32
-                    case 12: pos += 8; break;  // FLOAT64
-                    case 8: {  // STRING
+                    case 0: case 1: case 7: pos += 1; break;
+                    case 2: case 3: pos += 2; break;
+                    case 4: case 5: pos += 4; break;
+                    case 10: case 11: pos += 8; break;
+                    case 6: pos += 4; break;
+                    case 12: pos += 8; break;
+                    case 8: {
                         uint64_t slen = read_u64();
                         pos += slen;
                         break;
                     }
-                    case 9: {  // ARRAY
+                    case 9: {
                         uint32_t arr_type = read_i32();
                         uint64_t arr_len = read_u64();
                         for (uint64_t k = 0; k < arr_len; k++) {
@@ -623,170 +738,141 @@ private:
                 }
             };
 
-            if (key.find("embedding_length") != std::string::npos) {
-                config.n_embd = read_i32();
-            } else if (key.find("feed_forward_length") != std::string::npos) {
-                config.n_ffn = read_i32();
-            } else if (key.find("attention.head_count") != std::string::npos &&
-                       key.find("_kv") == std::string::npos) {
-                config.n_heads = read_i32();
-            } else if (key.find("attention.head_count_kv") != std::string::npos) {
-                config.n_kv_heads = read_i32();
-            } else if (key.find("block_count") != std::string::npos) {
-                config.n_layers = read_i32();
-            } else if (key.find("context_length") != std::string::npos) {
-                config.max_seq_len = read_i32();
-            } else if (key.find("rope.freq_base") != std::string::npos) {
-                config.rope_freq_base = read_f32();
-            } else if (key.find("general.alignment") != std::string::npos) {
-                config.alignment = read_i32();
-            } else if (key.find("tokenizer.ggml.bos_token_id") != std::string::npos) {
+            // 使用统一的解析函数
+            if (key.find("tokenizer.ggml.bos_token_id") != std::string::npos) {
                 tok_bos_id = (uint32_t)read_i32();
+                config.metadata()[key] = tok_bos_id;
             } else if (key.find("tokenizer.ggml.eos_token_id") != std::string::npos) {
                 tok_eos_id = (uint32_t)read_i32();
+                config.metadata()[key] = tok_eos_id;
             } else if (key.find("tokenizer.ggml.tokens") != std::string::npos) {
                 uint32_t arr_type = read_i32(); (void)arr_type;
                 uint64_t arr_len = read_u64();
                 tok_tokens_data = data + pos;
                 tok_n_tokens = arr_len;
-                // Skip string array
                 for (uint64_t j = 0; j < arr_len; j++) {
                     uint64_t slen = read_u64();
                     pos += slen;
                 }
+                config.metadata()[key] = arr_len;
             } else if (key.find("tokenizer.ggml.scores") != std::string::npos) {
                 uint32_t arr_type = read_i32(); (void)arr_type;
                 uint64_t arr_len = read_u64();
                 tok_scores_data = data + pos;
                 tok_n_scores = arr_len;
-                // Skip float array
                 pos += arr_len * 4;
+                config.metadata()[key] = arr_len;
             } else if (key.find("tokenizer.ggml.token_type") != std::string::npos) {
-                // Skip token type array
                 uint32_t arr_type = read_i32(); (void)arr_type;
                 uint64_t arr_len = read_u64();
                 pos += arr_len * 4;
             } else if (key.find("tokenizer.ggml.pre") != std::string::npos) {
                 skip_value();
-            } else if (key.find("attention.key_length") != std::string::npos) {
-                config.head_dim = read_i32();
+            } else if (vtype == 4 || vtype == 5) {
+                int32_t val = read_i32();
+                parser::parse_config_value(key, val, config.config);
+            } else if (vtype == 6) {
+                float val = read_f32();
+                parser::parse_config_value(key, val, config.config);
             } else {
                 skip_value();
             }
         }
 
-        if (tok_bos_id == 1 && config.vocab_size > 150000) {
+        // BOS/EOS 默认值调整
+        if (tok_bos_id == 1 && getInt(config.ints(), cfg::VOCAB_SIZE) > 150000) {
             tok_bos_id = 151643;
             tok_eos_id = 151645;
         }
 
-        // Limit max_seq_len for memory efficiency
-        if (max_seq_len_override > 0 && max_seq_len_override < config.max_seq_len) {
-            config.max_seq_len = max_seq_len_override;
-        } else if (config.max_seq_len > 2048) {
-            config.max_seq_len = 2048;  // Cap at 2048
+        // 限制 max_seq_len
+        if (max_seq_len_override > 0 && max_seq_len_override < getInt(config.ints(), cfg::MAX_SEQ_LEN)) {
+            config.ints()[cfg::MAX_SEQ_LEN] = max_seq_len_override;
+        } else if (getInt(config.ints(), cfg::MAX_SEQ_LEN) > 2048) {
+            config.ints()[cfg::MAX_SEQ_LEN] = 2048;
         }
-        if (config.head_dim < 1) config.head_dim = config.n_embd / config.n_heads;
+        if (getInt(config.ints(), cfg::HEAD_DIM) < 1) {
+            config.ints()[cfg::HEAD_DIM] = getInt(config.ints(), cfg::N_EMBD) / getInt(config.ints(), cfg::N_HEADS);
+        }
 
         // Parse tensor info
-        struct TensorInfo {
-            std::string name;
-            uint32_t n_dims;
-            uint64_t dims[4];
-            uint32_t type;
-            uint64_t offset;
-        };
-        std::vector<TensorInfo> tinfos(n_tensors);
+        std::vector<metadata::TensorInfo> tinfos(n_tensors);
 
         for (uint64_t i = 0; i < n_tensors; i++) {
             uint64_t name_len; std::memcpy(&name_len, data+pos, 8); pos += 8;
+            if (pos + name_len > mmap_size) {
+                fprintf(stderr, "\nError: name_len exceeds mmap_size\n");
+                return -1;
+            }
             tinfos[i].name.assign((const char*)data+pos, name_len); pos += name_len;
             std::memcpy(&tinfos[i].n_dims, data+pos, 4); pos += 4;
             for (uint32_t d = 0; d < tinfos[i].n_dims; d++) {
                 std::memcpy(&tinfos[i].dims[d], data+pos, 8); pos += 8;
             }
             std::memcpy(&tinfos[i].type, data+pos, 4); pos += 4;
-            tinfos[i].type += 1;
+            tinfos[i].type += 1;  // GGUF 类型值需要 +1 才能匹配枚举
             std::memcpy(&tinfos[i].offset, data+pos, 8); pos += 8;
         }
 
-        size_t tensor_data_base = ((pos + config.alignment - 1) / config.alignment) * config.alignment;
+        int alignment = getInt(config.ints(), cfg::ALIGNMENT);
+        if (alignment <= 0) alignment = 32;
+        size_t tensor_data_base = ((pos + alignment - 1) / alignment) * alignment;
 
+        // 使用映射表加载张量
         for (const auto& ti : tinfos) {
             const void* ptr = (const uint8_t*)mmap_addr + tensor_data_base + ti.offset;
             GGUFType qtype = (GGUFType)ti.type;
 
-            if (ti.name == "token_embd.weight") {
-                weights.token_embd = ptr; weights.type_token_embd = qtype;
-            } else if (ti.name == "output_norm.weight") {
-                weights.output_norm = ptr; weights.type_output_norm = qtype;
-            } else if (ti.name == "output.weight") {
-                weights.output = ptr; weights.type_output = qtype;
-            } else if (ti.name.size() > 4 && ti.name.substr(0, 4) == "blk.") {
-                size_t dot = ti.name.find('.', 4);
-                if (dot != std::string::npos) {
-                    int layer = std::stoi(ti.name.substr(4, dot - 4));
-                    std::string suffix = ti.name.substr(dot + 1);
-                    LayerWeights* lw = &weights.layers[layer];
-
-                    if (suffix == "attn_norm.weight") { lw->attn_norm = ptr; lw->type_attn_norm = qtype; }
-                    else if (suffix == "attn_q.weight") { lw->attn_q = ptr; lw->type_attn_q = qtype; }
-                    else if (suffix == "attn_k.weight") { lw->attn_k = ptr; lw->type_attn_k = qtype; }
-                    else if (suffix == "attn_v.weight") { lw->attn_v = ptr; lw->type_attn_v = qtype; }
-                    else if (suffix == "attn_output.weight") { lw->attn_output = ptr; lw->type_attn_output = qtype; }
-                    else if (suffix == "ffn_norm.weight") { lw->ffn_norm = ptr; lw->type_ffn_norm = qtype; }
-                    else if (suffix == "ffn_gate.weight") { lw->ffn_gate = ptr; lw->type_ffn_gate = qtype; }
-                    else if (suffix == "ffn_down.weight") { lw->ffn_down = ptr; lw->type_ffn_down = qtype; }
-                    else if (suffix == "ffn_up.weight") { lw->ffn_up = ptr; lw->type_ffn_up = qtype; }
-                    else if (suffix == "attn_q.bias") { lw->attn_q_b = ptr; lw->type_attn_q_b = qtype; }
-                    else if (suffix == "attn_k.bias") { lw->attn_k_b = ptr; lw->type_attn_k_b = qtype; }
-                    else if (suffix == "attn_v.bias") { lw->attn_v_b = ptr; lw->type_attn_v_b = qtype; }
-                    else if (suffix == "attn_output.bias") { lw->attn_output_b = ptr; lw->type_attn_output_b = qtype; }
-                    else if (suffix == "ffn_gate.bias") { lw->ffn_gate_b = ptr; lw->type_ffn_gate_b = qtype; }
-                    else if (suffix == "ffn_down.bias") { lw->ffn_down_b = ptr; lw->type_ffn_down_b = qtype; }
-                    else if (suffix == "ffn_up.bias") { lw->ffn_up_b = ptr; lw->type_ffn_up_b = qtype; }
-                    else if (suffix == "attn_q_norm.weight") { lw->attn_q_norm = ptr; lw->type_attn_q_norm = qtype; }
-                    else if (suffix == "attn_k_norm.weight") { lw->attn_k_norm = ptr; lw->type_attn_k_norm = qtype; }
+            // 处理输出层权重
+            if (parser::is_output_weight(ti.name)) {
+                std::string weight_type = parser::get_output_type(ti.name);
+                weights.set(weight_type, ptr, (uint32_t)qtype);
+            }
+            // 处理层权重
+            else if (parser::is_layer_weight(ti.name)) {
+                auto [layer_id, suffix] = parser::parse_layer_name(ti.name);
+                if (layer_id >= 0 && layer_id < getInt(config.ints(), cfg::N_LAYERS)) {
+                    // 移除 ".weight" 后缀
+                    if (suffix.size() > 7 && suffix.compare(suffix.size() - 7, 7, ".weight") == 0) {
+                        suffix = suffix.substr(0, suffix.size() - 7);
+                    }
+                    weights.get_layer(layer_id).set(suffix, ptr, (uint32_t)qtype);
                 }
             }
         }
 
-        if (!weights.output) {
-            weights.output = weights.token_embd;
-            weights.type_output = weights.type_token_embd;
+        // output 默认指向 token_embd
+        if (!weights.get(output::OUTPUT)) {
+            auto embd = weights.get(output::TOKEN_EMBD);
+            weights.set(output::OUTPUT, embd.ptr, embd.type);
         }
 
-        if (config.vocab_size == 0) {
+        // 获取 vocab_size
+        if (getInt(config.ints(), cfg::VOCAB_SIZE) == 0) {
             for (const auto& ti : tinfos) {
-                if (ti.name == "token_embd.weight" && ti.n_dims >= 2) {
-                    config.vocab_size = (ti.dims[0] == (uint64_t)config.n_embd) ? (int)ti.dims[1] : (int)ti.dims[0];
+                std::string embd_name = std::string(output::TOKEN_EMBD) + ".weight";
+                if (ti.name == embd_name && ti.n_dims >= 2) {
+                    config.ints()[cfg::VOCAB_SIZE] = (ti.dims[0] == (uint64_t)getInt(config.ints(), cfg::N_EMBD)) ? (int)ti.dims[1] : (int)ti.dims[0];
                     break;
                 }
             }
         }
-        if (config.vocab_size == 0 && tok_n_tokens > 0) {
-            config.vocab_size = (int)tok_n_tokens;
+        if (getInt(config.ints(), cfg::VOCAB_SIZE) == 0 && tok_n_tokens > 0) {
+            config.ints()[cfg::VOCAB_SIZE] = (int)tok_n_tokens;
         }
 
-        config.weight_type = weights.layers[0].type_attn_q;
-
-        fprintf(stderr, "Model config:\n");
-        fprintf(stderr, "  n_embd=%d, n_ffn=%d, n_heads=%d, n_kv_heads=%d\n",
-                config.n_embd, config.n_ffn, config.n_heads, config.n_kv_heads);
-        fprintf(stderr, "  n_layers=%d, vocab_size=%d, max_seq=%d\n",
-                config.n_layers, config.vocab_size, config.max_seq_len);
-        fprintf(stderr, "  head_dim=%d, rope_base=%.1f\n", config.head_dim, config.rope_freq_base);
+        config.ints()[cfg::WEIGHT_TYPE] = weights.get_layer(0).get(layer::ATTN_Q).type;
 
         return 0;
     }
 
     int allocate_run_state() {
-        int dim = config.n_embd;
-        int n_ffn = config.n_ffn;
-        int q_dim = config.n_heads * config.head_dim;
-        int kv_dim = config.n_kv_heads * config.head_dim;
-        int half_dim = config.head_dim / 2;
-        int max_scratch = std::max({dim, q_dim, n_ffn, config.vocab_size});
+        int dim = getInt(config.ints(), cfg::N_EMBD);
+        int n_ffn = getInt(config.ints(), cfg::N_FFN);
+        int q_dim = getInt(config.ints(), cfg::N_HEADS) * getInt(config.ints(), cfg::HEAD_DIM);
+        int kv_dim = getInt(config.ints(), cfg::N_KV_HEADS) * getInt(config.ints(), cfg::HEAD_DIM);
+        int half_dim = getInt(config.ints(), cfg::HEAD_DIM) / 2;
+        int max_scratch = std::max({dim, q_dim, n_ffn, getInt(config.ints(), cfg::VOCAB_SIZE)});
 
         state.x.resize((size_t)max_scratch, 0.0f);
         state.xb.resize((size_t)max_scratch, 0.0f);
@@ -794,40 +880,46 @@ private:
         state.q.resize((size_t)q_dim, 0.0f);
         state.hb.resize((size_t)n_ffn, 0.0f);
         state.hb2.resize((size_t)n_ffn, 0.0f);
-        state.logits.resize((size_t)config.vocab_size, 0.0f);
+        state.logits.resize((size_t)getInt(config.ints(), cfg::VOCAB_SIZE), 0.0f);
         state.dequant_scratch.resize((size_t)max_scratch, 0.0f);
-        state.rope_cos.resize((size_t)config.max_seq_len * half_dim, 0.0f);
-        state.rope_sin.resize((size_t)config.max_seq_len * half_dim, 0.0f);
+        state.rope_cos.resize((size_t)getInt(config.ints(), cfg::MAX_SEQ_LEN) * half_dim, 0.0f);
+        state.rope_sin.resize((size_t)getInt(config.ints(), cfg::MAX_SEQ_LEN) * half_dim, 0.0f);
 
-        // Norm weights - use flat arrays for efficiency
-        state.attn_norm_w.resize((size_t)config.n_layers);
-        state.ffn_norm_w.resize((size_t)config.n_layers);
+        // 归一化权重
+        state.attn_norm_w.resize((size_t)getInt(config.ints(), cfg::N_LAYERS));
+        state.ffn_norm_w.resize((size_t)getInt(config.ints(), cfg::N_LAYERS));
         state.output_norm_w.resize((size_t)dim);
 
-        for (int l = 0; l < config.n_layers; l++) {
+        for (int l = 0; l < getInt(config.ints(), cfg::N_LAYERS); l++) {
             state.attn_norm_w[l].resize((size_t)dim);
             state.ffn_norm_w[l].resize((size_t)dim);
-            if (weights.layers[l].type_attn_norm != GGUFType::NONE) {
-                dequantize_row(weights.layers[l].attn_norm, state.attn_norm_w[l].data(), dim, weights.layers[l].type_attn_norm);
+
+            auto attn_norm = weights.get_layer(l).get(layer::ATTN_NORM);
+            auto ffn_norm = weights.get_layer(l).get(layer::FFN_NORM);
+
+            if (attn_norm) {
+                dequantize_row(attn_norm.ptr, state.attn_norm_w[l].data(), dim, (GGUFType)attn_norm.type);
             }
-            if (weights.layers[l].type_ffn_norm != GGUFType::NONE) {
-                dequantize_row(weights.layers[l].ffn_norm, state.ffn_norm_w[l].data(), dim, weights.layers[l].type_ffn_norm);
+            if (ffn_norm) {
+                dequantize_row(ffn_norm.ptr, state.ffn_norm_w[l].data(), dim, (GGUFType)ffn_norm.type);
             }
         }
-        if (weights.type_output_norm != GGUFType::NONE) {
-            dequantize_row(weights.output_norm, state.output_norm_w.data(), dim, weights.type_output_norm);
+
+        auto output_norm = weights.get(output::OUTPUT_NORM);
+        if (output_norm) {
+            dequantize_row(output_norm.ptr, state.output_norm_w.data(), dim, (GGUFType)output_norm.type);
         }
 
-        // Biases - use flat arrays
-        state.attn_q_bias.resize((size_t)config.n_layers);
-        state.attn_k_bias.resize((size_t)config.n_layers);
-        state.attn_v_bias.resize((size_t)config.n_layers);
-        state.attn_output_bias.resize((size_t)config.n_layers);
-        state.ffn_gate_bias.resize((size_t)config.n_layers);
-        state.ffn_up_bias.resize((size_t)config.n_layers);
-        state.ffn_down_bias.resize((size_t)config.n_layers);
+        // 偏置
+        state.attn_q_bias.resize((size_t)getInt(config.ints(), cfg::N_LAYERS));
+        state.attn_k_bias.resize((size_t)getInt(config.ints(), cfg::N_LAYERS));
+        state.attn_v_bias.resize((size_t)getInt(config.ints(), cfg::N_LAYERS));
+        state.attn_output_bias.resize((size_t)getInt(config.ints(), cfg::N_LAYERS));
+        state.ffn_gate_bias.resize((size_t)getInt(config.ints(), cfg::N_LAYERS));
+        state.ffn_up_bias.resize((size_t)getInt(config.ints(), cfg::N_LAYERS));
+        state.ffn_down_bias.resize((size_t)getInt(config.ints(), cfg::N_LAYERS));
 
-        for (int l = 0; l < config.n_layers; l++) {
+        for (int l = 0; l < getInt(config.ints(), cfg::N_LAYERS); l++) {
             state.attn_q_bias[l].resize((size_t)q_dim, 0.0f);
             state.attn_k_bias[l].resize((size_t)kv_dim, 0.0f);
             state.attn_v_bias[l].resize((size_t)kv_dim, 0.0f);
@@ -836,48 +928,54 @@ private:
             state.ffn_up_bias[l].resize((size_t)n_ffn, 0.0f);
             state.ffn_down_bias[l].resize((size_t)dim, 0.0f);
 
-            LayerWeights* lw = &weights.layers[l];
-            if (lw->attn_q_b && lw->type_attn_q_b != GGUFType::NONE)
-                dequantize_row(lw->attn_q_b, state.attn_q_bias[l].data(), q_dim, lw->type_attn_q_b);
-            if (lw->attn_k_b && lw->type_attn_k_b != GGUFType::NONE)
-                dequantize_row(lw->attn_k_b, state.attn_k_bias[l].data(), kv_dim, lw->type_attn_k_b);
-            if (lw->attn_v_b && lw->type_attn_v_b != GGUFType::NONE)
-                dequantize_row(lw->attn_v_b, state.attn_v_bias[l].data(), kv_dim, lw->type_attn_v_b);
-            if (lw->attn_output_b && lw->type_attn_output_b != GGUFType::NONE)
-                dequantize_row(lw->attn_output_b, state.attn_output_bias[l].data(), dim, lw->type_attn_output_b);
-            if (lw->ffn_gate_b && lw->type_ffn_gate_b != GGUFType::NONE)
-                dequantize_row(lw->ffn_gate_b, state.ffn_gate_bias[l].data(), n_ffn, lw->type_ffn_gate_b);
-            if (lw->ffn_up_b && lw->type_ffn_up_b != GGUFType::NONE)
-                dequantize_row(lw->ffn_up_b, state.ffn_up_bias[l].data(), n_ffn, lw->type_ffn_up_b);
-            if (lw->ffn_down_b && lw->type_ffn_down_b != GGUFType::NONE)
-                dequantize_row(lw->ffn_down_b, state.ffn_down_bias[l].data(), dim, lw->type_ffn_down_b);
+            LayerWeights& lw = weights.get_layer(l);
+            auto q_b = lw.get(layer::ATTN_Q_B);
+            auto k_b = lw.get(layer::ATTN_K_B);
+            auto v_b = lw.get(layer::ATTN_V_B);
+            auto out_b = lw.get(layer::ATTN_OUTPUT_B);
+            auto gate_b = lw.get(layer::FFN_GATE_B);
+            auto up_b = lw.get(layer::FFN_UP_B);
+            auto down_b = lw.get(layer::FFN_DOWN_B);
+
+            if (q_b) dequantize_row(q_b.ptr, state.attn_q_bias[l].data(), q_dim, (GGUFType)q_b.type);
+            if (k_b) dequantize_row(k_b.ptr, state.attn_k_bias[l].data(), kv_dim, (GGUFType)k_b.type);
+            if (v_b) dequantize_row(v_b.ptr, state.attn_v_bias[l].data(), kv_dim, (GGUFType)v_b.type);
+            if (out_b) dequantize_row(out_b.ptr, state.attn_output_bias[l].data(), dim, (GGUFType)out_b.type);
+            if (gate_b) dequantize_row(gate_b.ptr, state.ffn_gate_bias[l].data(), n_ffn, (GGUFType)gate_b.type);
+            if (up_b) dequantize_row(up_b.ptr, state.ffn_up_bias[l].data(), n_ffn, (GGUFType)up_b.type);
+            if (down_b) dequantize_row(down_b.ptr, state.ffn_down_bias[l].data(), dim, (GGUFType)down_b.type);
         }
 
-        // QK-Norm weights
-        state.attn_q_norm_w.resize((size_t)config.n_layers);
-        state.attn_k_norm_w.resize((size_t)config.n_layers);
-        for (int l = 0; l < config.n_layers; l++) {
-            state.attn_q_norm_w[l].resize((size_t)config.head_dim);
-            state.attn_k_norm_w[l].resize((size_t)config.head_dim);
-            if (weights.layers[l].attn_q_norm && weights.layers[l].type_attn_q_norm != GGUFType::NONE) {
-                dequantize_row(weights.layers[l].attn_q_norm, state.attn_q_norm_w[l].data(), config.head_dim, weights.layers[l].type_attn_q_norm);
+        // QK-Norm 权重
+        state.attn_q_norm_w.resize((size_t)getInt(config.ints(), cfg::N_LAYERS));
+        state.attn_k_norm_w.resize((size_t)getInt(config.ints(), cfg::N_LAYERS));
+        for (int l = 0; l < getInt(config.ints(), cfg::N_LAYERS); l++) {
+            state.attn_q_norm_w[l].resize((size_t)getInt(config.ints(), cfg::HEAD_DIM));
+            state.attn_k_norm_w[l].resize((size_t)getInt(config.ints(), cfg::HEAD_DIM));
+
+            LayerWeights& lw = weights.get_layer(l);
+            auto q_norm = lw.get(layer::ATTN_Q_NORM);
+            auto k_norm = lw.get(layer::ATTN_K_NORM);
+
+            if (q_norm) {
+                dequantize_row(q_norm.ptr, state.attn_q_norm_w[l].data(), getInt(config.ints(), cfg::HEAD_DIM), (GGUFType)q_norm.type);
             }
-            if (weights.layers[l].attn_k_norm && weights.layers[l].type_attn_k_norm != GGUFType::NONE) {
-                dequantize_row(weights.layers[l].attn_k_norm, state.attn_k_norm_w[l].data(), config.head_dim, weights.layers[l].type_attn_k_norm);
+            if (k_norm) {
+                dequantize_row(k_norm.ptr, state.attn_k_norm_w[l].data(), getInt(config.ints(), cfg::HEAD_DIM), (GGUFType)k_norm.type);
             }
         }
 
-        // KV Cache - use config.max_seq_len for proper indexing
-        size_t kv_elements = (size_t)config.n_layers * (size_t)config.max_seq_len * (size_t)kv_dim;
+        // KV Cache
+        size_t kv_elements = (size_t)getInt(config.ints(), cfg::N_LAYERS) * (size_t)getInt(config.ints(), cfg::MAX_SEQ_LEN) * (size_t)kv_dim;
         state.key_cache.resize(kv_elements, 0);
         state.val_cache.resize(kv_elements, 0);
 
-        // RoPE tables
-        for (int pos = 0; pos < config.max_seq_len; pos++) {
+        // RoPE 表
+        for (int pos = 0; pos < getInt(config.ints(), cfg::MAX_SEQ_LEN); pos++) {
             float* cos_row = state.rope_cos.data() + (size_t)pos * half_dim;
             float* sin_row = state.rope_sin.data() + (size_t)pos * half_dim;
             for (int i = 0; i < half_dim; i++) {
-                float theta = (float)pos / std::pow(config.rope_freq_base, (float)(2 * i) / (float)config.head_dim);
+                float theta = (float)pos / std::pow(getFloat(config.floats(), cfg::ROPE_FREQ_BASE), (float)(2 * i) / (float)getInt(config.ints(), cfg::HEAD_DIM));
                 cos_row[i] = std::cos(theta);
                 sin_row[i] = std::sin(theta);
             }

@@ -7,6 +7,25 @@
 #include <chrono>
 #include <clocale>
 
+// 使用 gguf_metadata.hpp 中定义的辅助函数和常量
+using parser::getInt;
+using parser::getFloat;
+using parser::getUint;
+using parser::getBool;
+using cfg::N_EMBD;
+using cfg::N_FFN;
+using cfg::N_HEADS;
+using cfg::N_KV_HEADS;
+using cfg::N_LAYERS;
+using cfg::VOCAB_SIZE;
+using cfg::MAX_SEQ_LEN;
+using cfg::HEAD_DIM;
+using cfg::ROPE_FREQ_BASE;
+using cfg::ALIGNMENT;
+using cfg::WEIGHT_TYPE;
+using cfg::USE_PREFETCH;
+using cfg::USE_EVICT;
+
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -139,7 +158,6 @@ int main(int argc, char** argv) {
     }
 
     // Load model
-    std::cerr << "Loading model: " << model_path << "\n";
     Model model;
     if (model.load(model_path, context_override, enable_prefetch, enable_evict) != 0) {
         std::cerr << "Failed to load model\n";
@@ -153,7 +171,7 @@ int main(int argc, char** argv) {
     if (tokenizer.load(model.tok_tokens_data, model.tok_n_tokens,
                        model.tok_scores_data, model.tok_n_scores,
                        model.tok_bos_id, model.tok_eos_id,
-                       model.config.vocab_size) != 0) {
+                       getInt(model.config.ints(), cfg::VOCAB_SIZE)) != 0) {
         std::cerr << "Failed to load tokenizer\n";
         return 1;
     }
@@ -175,11 +193,11 @@ int main(int argc, char** argv) {
     if (chat_mode) {
         std::cerr << "\n--- Entering Chat Mode (Qwen3) ---\n";
         std::cerr << "Type 'exit' to quit, 'clear' to reset context.\n\n";
-        
+
         long long input_token_count = 0, input_time_ms = 0, gen_token_count = 0, gen_time_ms = 0;
         char input_buf[2048];
         int chat_pos = 0;
-        int max_context = model.config.max_seq_len;
+        int max_context = getInt(model.config.ints(), cfg::MAX_SEQ_LEN);
         const char* system_prompt = "<|im_start|>system\nYou are Qwen, a helpful assistant.<|im_end|>\n";
         std::vector<int> initial_tokens;
         int n_system = tokenizer.encode_qwen(system_prompt, initial_tokens, true);
@@ -238,7 +256,7 @@ int main(int argc, char** argv) {
             gen_time_ms -= get_time_ms();
             while (chat_pos < max_context && gen_tokens < max_tokens) {
                 float* logits = model.forward(token, chat_pos++);
-                int next = sampler.sample(logits, model.config.vocab_size);
+                int next = sampler.sample(logits, getInt(model.config.ints(), cfg::VOCAB_SIZE));
                 
                 if (next == (int)tokenizer.eos_id || next == 151645) {
                     printf("\n");
@@ -290,20 +308,20 @@ int main(int argc, char** argv) {
 
     int token = prompt_tokens[0];
     int pos = 0;
-    int total_steps = std::min(n_prompt + max_tokens, model.config.max_seq_len);
+    int total_steps = std::min(n_prompt + max_tokens, getInt(model.config.ints(), cfg::MAX_SEQ_LEN));
 
     float* logits = model.forward_batch(prompt_tokens, 0);
     t_first_token = get_time_ms();
 
-    int next = sampler.sample(logits, model.config.vocab_size);
+    int next = sampler.sample(logits, getInt(model.config.ints(), cfg::VOCAB_SIZE));
     const char* piece = tokenizer.decode_qwen(next);
     fwrite(piece, 1, strlen(piece), stdout);
     fflush(stdout);
 
     token = next;
     total_gen = 1;
-    pos = n_prompt; 
-    total_steps = std::min(n_prompt + max_tokens, model.config.max_seq_len);
+    pos = n_prompt;
+    total_steps = std::min(n_prompt + max_tokens, getInt(model.config.ints(), cfg::MAX_SEQ_LEN));
 
     for (; pos < total_steps; pos++) {
         float* logits = model.forward(token, pos);
@@ -316,7 +334,7 @@ int main(int argc, char** argv) {
                 t_first_token = get_time_ms();
             }
 
-            next = sampler.sample(logits, model.config.vocab_size);
+            next = sampler.sample(logits, getInt(model.config.ints(), cfg::VOCAB_SIZE));
 
             const char* piece = tokenizer.decode_qwen(next);
             // 使用 fwrite 直接输出字节，避免 UTF-8 字节碎片问题
