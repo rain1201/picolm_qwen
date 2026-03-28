@@ -17,6 +17,7 @@
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <memoryapi.h>
 #else
 #include <sys/mman.h>
 #include <fcntl.h>
@@ -205,9 +206,18 @@ struct Model {
         config.ints()[cfg::USE_PREFETCH] = prefetch ? 1 : 0;
         config.ints()[cfg::USE_EVICT] = evict ? 1 : 0;
 
-        if (mmap_file(path) != 0) return -1;
-        if (parse_gguf(max_seq_len_override) != 0) return -1;
-        if (allocate_run_state() != 0) return -1;
+        if (mmap_file(path) != 0) {
+            fprintf(stderr, "[Load Error] mmap_file failed.\n");
+            return -1;
+        }
+        if (parse_gguf(max_seq_len_override) != 0) {
+            fprintf(stderr, "[Load Error] parse_gguf failed. (Check if it is a valid GGUF file)\n");
+            return -1;
+        }
+        if (allocate_run_state() != 0) {
+            fprintf(stderr, "[Load Error] allocate_run_state failed.\n");
+            return -1;
+        }
 
         return 0;
     }
@@ -641,28 +651,51 @@ private:
     int mmap_file(const char* path) {
 #ifdef _WIN32
         file_handle = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, nullptr,
-                                  OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (file_handle == INVALID_HANDLE_VALUE) return -1;
+                                  OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS, nullptr);
+        if (file_handle == INVALID_HANDLE_VALUE) {
+            fprintf(stderr, "[Error] CreateFileA failed for '%s'. Windows Error Code: %lu\n", path, GetLastError());
+            return -1;
+        }
 
         LARGE_INTEGER fsize;
-        GetFileSizeEx(file_handle, &fsize);
+        if (!GetFileSizeEx(file_handle, &fsize)) {
+            fprintf(stderr, "[Error] GetFileSizeEx failed. Windows Error Code: %lu\n", GetLastError());
+            CloseHandle(file_handle);
+            return -1;
+        }
         mmap_size = (size_t)fsize.QuadPart;
 
         map_handle = CreateFileMappingA(file_handle, nullptr, PAGE_READONLY, 0, 0, nullptr);
-        if (!map_handle) { CloseHandle(file_handle); return -1; }
+        if (!map_handle) { 
+            fprintf(stderr, "[Error] CreateFileMappingA failed. Windows Error Code: %lu\n", GetLastError());
+            CloseHandle(file_handle); 
+            return -1; 
+        }
 
         mmap_addr = MapViewOfFile(map_handle, FILE_MAP_READ, 0, 0, 0);
-        if (!mmap_addr) { CloseHandle(map_handle); CloseHandle(file_handle); return -1; }
+        if (!mmap_addr) { 
+            fprintf(stderr, "[Error] MapViewOfFile failed. Windows Error Code: %lu\n", GetLastError());
+            CloseHandle(map_handle); 
+            CloseHandle(file_handle); 
+            return -1; 
+        }
 #else
         fd = open(path, O_RDONLY);
-        if (fd < 0) return -1;
+        if (fd < 0) {
+            fprintf(stderr, "[Error] open() failed for '%s'\n", path);
+            return -1;
+        }
 
         struct stat st;
         fstat(fd, &st);
         mmap_size = (size_t)st.st_size;
 
         mmap_addr = mmap(nullptr, mmap_size, PROT_READ, MAP_PRIVATE, fd, 0);
-        if (mmap_addr == MAP_FAILED) { close(fd); return -1; }
+        if (mmap_addr == MAP_FAILED) { 
+            fprintf(stderr, "[Error] mmap() failed\n");
+            close(fd); 
+            return -1; 
+        }
 #endif
         return 0;
     }
@@ -985,7 +1018,81 @@ private:
                         state.rope_cos.capacity() * sizeof(float) * 2 +
                         kv_elements * sizeof(uint16_t) * 2;
 
-        fprintf(stderr, "Allocating %.2f MB for runtime state\n", state.mem_size / (1024.0 * 1024.0));
+        // ================= 终极内存锁定逻辑 (带精准计算和容错检查) =================
+        
+        size_t total_lock_bytes = 0;
+
+        // 阶段 1: 仅仅统计所需锁定的字节数，不执行锁定
+        auto calc_vec_1d = [&total_lock_bytes](auto& vec) {
+            if (!vec.empty()) total_lock_bytes += vec.capacity() * sizeof(vec[0]);
+        };
+        auto calc_vec_2d = [&](auto& vec2d) {
+            calc_vec_1d(vec2d);
+            for (auto& inner : vec2d) calc_vec_1d(inner);
+        };
+
+        calc_vec_1d(state.x); calc_vec_1d(state.xb); calc_vec_1d(state.xb2);
+        calc_vec_1d(state.q); calc_vec_1d(state.hb); calc_vec_1d(state.hb2);
+        calc_vec_1d(state.logits); calc_vec_1d(state.dequant_scratch);
+        calc_vec_1d(state.key_cache); calc_vec_1d(state.val_cache);
+        calc_vec_1d(state.rope_cos); calc_vec_1d(state.rope_sin);
+        calc_vec_1d(state.output_norm_w);
+        calc_vec_2d(state.attn_norm_w); calc_vec_2d(state.ffn_norm_w);
+        calc_vec_2d(state.attn_q_bias); calc_vec_2d(state.attn_k_bias);
+        calc_vec_2d(state.attn_v_bias); calc_vec_2d(state.attn_output_bias);
+        calc_vec_2d(state.ffn_gate_bias); calc_vec_2d(state.ffn_up_bias);
+        calc_vec_2d(state.ffn_down_bias);
+        calc_vec_2d(state.attn_q_norm_w); calc_vec_2d(state.attn_k_norm_w);
+
+#ifdef _WIN32
+        // 阶段 2: 暴力扩充 Windows 工作集，额外预留 512MB 缓冲防越界
+        HANDLE hProcess = GetCurrentProcess();
+        SIZE_T min_sz, max_sz;
+        if (GetProcessWorkingSetSize(hProcess, &min_sz, &max_sz)) {
+            SIZE_T needed_extra = total_lock_bytes + (512ULL * 1024ULL * 1024ULL); // +512MB
+            if (!SetProcessWorkingSetSize(hProcess, min_sz + needed_extra, max_sz + needed_extra)) {
+                fprintf(stderr, "[Warning] SetProcessWorkingSetSize failed! Code: %lu\n", GetLastError());
+            }
+        }
+#endif
+
+        // 阶段 3: 真正执行锁定，并带上报错机制
+        auto do_lock_1d = [](auto& vec, const char* name) {
+            if (!vec.empty()) {
+                size_t bytes = vec.capacity() * sizeof(vec[0]);
+#ifdef _WIN32
+                if (!VirtualLock((LPVOID)vec.data(), bytes)) {
+                    fprintf(stderr, "[Warning] VirtualLock failed on %s! Code: %lu\n", name, GetLastError());
+                }
+#else
+                if (mlock((void*)vec.data(), bytes) != 0) {
+                    fprintf(stderr, "[Warning] mlock failed on %s!\n", name);
+                }
+#endif
+            }
+        };
+        auto do_lock_2d = [&](auto& vec2d, const char* name) {
+            do_lock_1d(vec2d, name);
+            for (auto& inner : vec2d) do_lock_1d(inner, name);
+        };
+
+        do_lock_1d(state.x, "state.x"); do_lock_1d(state.xb, "state.xb"); do_lock_1d(state.xb2, "state.xb2");
+        do_lock_1d(state.q, "state.q"); do_lock_1d(state.hb, "state.hb"); do_lock_1d(state.hb2, "state.hb2");
+        do_lock_1d(state.logits, "state.logits"); do_lock_1d(state.dequant_scratch, "state.dequant_scratch");
+        do_lock_1d(state.key_cache, "state.key_cache"); do_lock_1d(state.val_cache, "state.val_cache");
+        do_lock_1d(state.rope_cos, "state.rope_cos"); do_lock_1d(state.rope_sin, "state.rope_sin");
+        do_lock_1d(state.output_norm_w, "state.output_norm_w");
+        do_lock_2d(state.attn_norm_w, "state.attn_norm_w"); do_lock_2d(state.ffn_norm_w, "state.ffn_norm_w");
+        do_lock_2d(state.attn_q_bias, "state.attn_q_bias"); do_lock_2d(state.attn_k_bias, "state.attn_k_bias");
+        do_lock_2d(state.attn_v_bias, "state.attn_v_bias"); do_lock_2d(state.attn_output_bias, "state.attn_output_bias");
+        do_lock_2d(state.ffn_gate_bias, "state.ffn_gate_bias"); do_lock_2d(state.ffn_up_bias, "state.ffn_up_bias");
+        do_lock_2d(state.ffn_down_bias, "state.ffn_down_bias");
+        do_lock_2d(state.attn_q_norm_w, "state.attn_q_norm_w"); do_lock_2d(state.attn_k_norm_w, "state.attn_k_norm_w");
+
+        // ==============================================================================
+        
+        fprintf(stderr, "Allocating %.2f MB for runtime state (Locked: %.2f MB)\n", 
+                state.mem_size / (1024.0 * 1024.0), total_lock_bytes / (1024.0 * 1024.0));
         return 0;
     }
 };
