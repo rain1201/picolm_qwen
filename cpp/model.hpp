@@ -22,6 +22,8 @@
 #include <sys/mman.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/types.h>
+#include <sys/stat.h>
 #endif
 
 constexpr uint32_t GGUF_MAGIC = 0x46554747;
